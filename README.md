@@ -22,6 +22,7 @@ helm search repo modelsphere
 | [`autoconfig`](charts/autoconfig) | Keeps the routing layer in step with what is actually deployed: watches backends and rewrites OpenResty peers and cache-aware-router workers |
 | [`llmscaleoperator`](charts/llmscaleoperator) | The autoscaler the `sglang` and `vllm` charts hand their `LLMScaler` objects to: scales replicas on KV-cache utilization, queue depth and TPM rather than CPU |
 | [`rdma-injector`](charts/rdma-injector) | A mutating webhook that injects `NCCL_IB_HCA` and the node's RDMA device list into pods labelled `rdma-ib: "true"` |
+| [`console`](charts/console) | The ModelSphere community portal — identity (users, roles, login) and a federation gateway to Swiss and other backends |
 
 `sglang` and `vllm` pull in `cart` as a subchart, gated on `cart.enabled`.
 Installing either of them gives you an engine and a router that already know
