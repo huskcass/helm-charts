@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "console.fullname" . }}
+  labels:
+    {{- include "console.labels" . | nindent 4 }}
+data:
+  console.yaml: |
+    server:
+      addr: ":8080"
+      metricsAddr: {{ printf ":%d" (int .Values.metrics.port) | quote }}
+      auth:
+        {{- if .Values.auth.disabled }}
+        disabled: true
+        {{- end }}
+        issuer: {{ .Values.auth.issuer | quote }}
+        tokenTTL: {{ .Values.auth.tokenTTL | quote }}
+        # jwtSecret is injected from the Secret via env, not rendered here.
+    backends:
+      {{- range .Values.backends }}
+      - name: {{ .name | quote }}
+        prefix: {{ .prefix | quote }}
+        url: {{ .url | quote }}
+        {{- with .apiKeyEnv }}
+        apiKeyEnv: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      {{- $swissd := include "console.swiss.backend" . }}
+      {{- if $swissd }}
+      {{- $swissd = $swissd | fromJson }}
+      {{- range .Values.backends }}
+      {{- if eq .name "swiss" }}{{ fail "backends names \"swiss\" and swiss.enabled or externalSwiss.url adds one; drop the backends entry" }}{{ end }}
+      {{- end }}
+      # swissd: see the swiss and externalSwiss sections of values.
+      - name: swiss
+        prefix: /api/deploy
+        url: {{ $swissd.url | quote }}
+        {{- if $swissd.secretName }}
+        apiKeyEnv: SWISS_PROXY_KEY
+        {{- end }}
+      {{- end }}
+      {{- $gw := .Values.playground.gateway }}
+      {{- if include "console.gateway" . }}
+      # Resolved from the cluster at startup: see the gateway section of values.
+      - name: llm
+        prefix: /api/llm
+        {{- with $gw.apiKeyEnv }}
+        apiKeyEnv: {{ . | quote }}
+        {{- end }}
+        gateway:
+          {{- with include "console.gateway.profile" . }}
+          profile: {{ . | quote }}
+          {{- end }}
+          {{- with $gw.configMap }}
+          configMap: {{ . | quote }}
+          {{- end }}
+          {{- with $gw.service }}
+          service: {{ . | quote }}
+          {{- end }}
+          {{- with $gw.route }}
+          route: {{ . | quote }}
+          {{- end }}
+          {{- with $gw.secretRef }}
+          secretRef: {{ . | quote }}
+          {{- end }}
+      {{- end }}
+    {{- if include "console.router.enabled" . }}
+    router:
+      secret: {{ printf "%s/%s" .Release.Namespace (include "console.router.secret" .) | quote }}
+      backend: llm
+      {{- with .Values.router.maxBodyBytes }}
+      maxBodyBytes: {{ . | int64 }}
+      {{- end }}
+    {{- end }}
