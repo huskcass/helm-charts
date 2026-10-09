@@ -68,6 +68,23 @@
 {{- end -}}
 {{- end -}}
 
+{{- /* The GPU claim has to be explicit per role in every pd shape, not
+       just colocate. There is no "right" default a role should inherit
+       from the top level: prefill and decode rarely want the same count
+       (a 1P1D pattern usually splits 8 as 4/4 or 6/2, not 8/8), and in
+       colocate the merged pod would claim model.gpus twice if both roles
+       fell through (each engine reads the same default when its own gpus
+       is empty). Force the user to say what they mean per role, and to
+       leave model.gpus empty so there is one source of truth per engine.
+       A role with no GPU claim sets its gpus to "0", which is a real
+       value, not empty. */ -}}
+{{- $modelGpus := toString (.Values.model.gpus | default "") -}}
+{{- $pfGpus := toString ($pd.prefill.gpus | default "") -}}
+{{- $dcGpus := toString ($pd.decode.gpus | default "") -}}
+{{- if or (eq $pfGpus "") (eq $dcGpus "") (ne $modelGpus "") -}}
+{{- fail (printf "sglang: pd.enabled requires an explicit per-role GPU split -- set pd.prefill.gpus and pd.decode.gpus, and leave model.gpus empty. (model.gpus=%q, pd.prefill.gpus=%q, pd.decode.gpus=%q.) The two roles rarely want the same number, and in colocate model.gpus would be claimed twice; say what you mean per role. A role with no GPU claim sets its gpus to \"0\", which is a real value, not empty." $modelGpus $pfGpus $dcGpus) -}}
+{{- end -}}
+
 {{- /* Colocate is 1P1D inside a merged pod in v1: one prefill container, one
        decode container. Anything else the user set on the role would be
        silently ignored, so reject it. Scale by raising replicaCount (more
