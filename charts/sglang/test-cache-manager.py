@@ -253,8 +253,11 @@ def test_lease():
         # while this pod thinks it is protected.
         ld = os.path.join(lock_root(host), "h")
         lease = os.path.join(ld, ".lease")
-        os.close(cm.open_lock(lease))
-        orphan = os.stat(lease).st_ino
+        # Held open until the checks are done: once the holder and the waiter
+        # both let go of the orphan, a filesystem that recycles inode numbers
+        # (ext4) can hand its number straight to the replacement lease.
+        pin = cm.open_lock(lease)
+        orphan = os.fstat(pin).st_ino
 
         purging = holder(lease, "ex")           # stands in for a GC mid-purge
         waiter = subprocess.Popen([sys.executable, "-c", LEASE_WAITER, SRC, ld],
@@ -270,6 +273,7 @@ def test_lease():
               os.path.exists(lease) and held == str(os.stat(lease).st_ino), held)
         check("and a GC cannot take that one from under it", contended(lease, "ex"))
         release(waiter)
+        os.close(pin)
 
 
     suite("lease: a GC that locked an orphan does not get to call it exclusive")
