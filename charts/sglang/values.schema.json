@@ -40,6 +40,38 @@
         { "type": "integer", "minimum": 0 },
         { "type": "string", "pattern": "^([0-9]+%?)?$" }
       ]
+    },
+
+    "pdRole": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "replicas": { "type": "integer", "minimum": 0 },
+        "size": { "type": "integer", "minimum": 1 },
+        "httpPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "bootstrapPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "distPort": {
+          "description": "Quoted in values.yaml; empty means inherit lws.distPort. A/B + size >= 2 only: the rendezvous port for --dist-init-addr inside this role's group. Colocate and size-1 roles never render --dist-init-addr, so it is a no-op there.",
+          "type": ["string", "integer"]
+        },
+        "gpus": {
+          "description": "Quoted in values.yaml. Empty falls back to top-level model.gpus. 0/\"0\" means no GPU claim (a deliberate override, not a fallback).",
+          "type": ["string", "integer"]
+        },
+        "extraArgs": {
+          "description": "Appended after the top-level extraArgs for this role's engines; a repeated flag's last occurrence wins, so role flags override shared ones by construction.",
+          "type": "array",
+          "items": { "type": ["string", "integer", "number", "boolean"] }
+        },
+        "affinityReplace": {
+          "description": "Full REPLACEMENT of the top-level affinity for this role's pods when defined -- two affinities never merge. null means inherit.",
+          "type": ["object", "null"]
+        },
+        "schedulerName": {
+          "description": "Full replacement of the top-level schedulerName for this role's pods (A/B only; colocate never renders a role schedulerName).",
+          "type": "string"
+        }
+      }
     }
   },
 
@@ -96,6 +128,36 @@
                 "maxUnavailable": { "$ref": "#/definitions/intOrPercent" }
               }
             }
+          }
+        }
+      }
+    },
+
+    "pd": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "colocate": { "type": "boolean" },
+        "transferBackend": { "type": "string", "enum": ["mooncake"] },
+        "prefill": { "$ref": "#/definitions/pdRole" },
+        "decode": { "$ref": "#/definitions/pdRole" },
+        "router": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "replicas": { "type": "integer", "minimum": 1, "maximum": 2 },
+            "policy": { "type": "string", "minLength": 1 },
+            "imageOverride": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": { "type": "string" },
+                "tag": { "type": "string" }
+              }
+            },
+            "affinityReplace": { "type": ["object", "null"] },
+            "tolerationsReplace": { "type": ["array", "null"] }
           }
         }
       }

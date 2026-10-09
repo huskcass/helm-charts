@@ -33,35 +33,49 @@
     - preStop: see sglang.preStopScript.
 
   Call it as:  include "sglang.podSpec" (dict "root" $ "role" "leader")
+
+  The work is split into three defines so the pd colocate shape can put TWO
+  engines (and two hang-watchers) into ONE pod without copying the engine
+  container:
+
+    sglang.engineIdentity   turns a role into everything the engine command and
+                            its probes/preStop need -- the flags, the pd trio,
+                            the colocate port-name offset -- as a YAML dict, so
+                            a caller two hundred lines away reads ONE source of
+                            truth instead of re-deriving it. Renders nothing on
+                            its own; the dict is the whole output.
+    sglang.engineContainers the engine's container list item, plus the
+                            hang-watcher sidecar that watches it. Consumes the
+                            identity dict. Emits list items only (no
+                            `containers:` key) so colocate can interleave its
+                            router container.
+    sglang.podSpec          the whole one-engine pod: prologue, the identity,
+                            initContainers, `containers:` + engineContainers,
+                            then the volumes/scheduling scaffold.
 */}}
-{{- define "sglang.podSpec" -}}
+{{- define "sglang.engineIdentity" -}}
 {{- $root := .root }}
-{{- /* /dev/shm: the chart mounts one unless the values already do. A user who
-       mounts /dev/shm through volumeMounts keeps ownership of it -- emitting
-       the chart's as well would put two mounts on the same path and the pod
-       spec would be rejected. */}}
-{{- $userShm := false }}
-{{- range $root.Values.volumeMounts }}
-{{- if eq (.mountPath | default "") "/dev/shm" }}{{ $userShm = true }}{{ end }}
-{{- end }}
-{{- $shmOn := and $root.Values.shm.enabled (not $userShm) }}
-{{- /* A values file may already use the name this chart gives its /dev/shm
-       volume, for something else entirely. Two volumes cannot share a name, so
-       say so here rather than let the API server reject the pod with a message
-       that does not mention this chart. */}}
-{{- if $shmOn }}
-{{- range $root.Values.volumes }}
-{{- if eq (.name | default "") "dshm" }}
-{{- fail "volumes has an entry named \"dshm\", which is the name this chart gives the /dev/shm volume it adds by default. Rename that entry, or mount it at /dev/shm (the chart then leaves it alone), or set shm.enabled: false." }}
-{{- end }}
-{{- end }}
-{{- end }}
 {{- $role := .role }}
 {{- $lws := $root.Values.lws }}
 {{- $multi := ne $role "single" }}
-{{- $worker := eq $role "worker" }}
+{{- /* pd role strings ("prefill-leader", "decode-worker", ...) gate the pd
+       branches below; the role's values block flows in as .roleCfg from the
+       pd templates. Non-pd callers pass neither. */}}
+{{- $pdRole := or (hasPrefix "prefill-" $role) (hasPrefix "decode-" $role) }}
+{{- $roleCfg := .roleCfg | default dict }}
+{{- $worker := or (eq $role "worker") (hasSuffix "-worker" $role) }}
 {{- $serves := not $worker }}
-{{- $preStop := $root.Values.lifecycle.preStop }}
+{{- /* Colocate-only identity: in the merged pod the two engine containers and
+       their hang-watchers must not share a port name, a container name or a log
+       glob, and each sidecar gets its own listen port. Decode is the offset
+       side (idx/oc "1"); prefill keeps the plain names. Empty in every
+       one-engine pod, so non-colocate renders are unchanged. */}}
+{{- $oc := ternary "1" "" (and .colocate (hasPrefix "decode-" $role)) }}
+{{- $pname := printf "http%s" $oc }}
+{{- $hwOffset := ternary 1 0 (eq $oc "1") }}
+{{- $hwPort := add (int $root.Values.hangWatcher.port) $hwOffset }}
+{{- $pobj := ternary $root.Values.pd.decode $root.Values.pd.prefill (hasPrefix "decode-" $role) }}
+{{- $httpPort := ternary ($pobj.httpPort | default $root.Values.service.port) $root.Values.service.port $pdRole }}
 {{- /* Defined -- including as [] -- takes the container over, and nothing below
        is built. [] renders no command at all: the image's ENTRYPOINT. */}}
 {{- $cmd := $root.Values.commandOverride }}
@@ -87,7 +101,7 @@
       (printf "--model-path=%s" $root.Values.model.mountPath)
       (printf "--served-model-name=%s" $root.Values.model.name)
       "--host=0.0.0.0"
-      (printf "--port=%v" $root.Values.service.port) }}
+      (printf "--port=%v" $httpPort) }}
 {{- /* Left out when empty, so SGLang uses the model's own context length. */}}
 {{- with $root.Values.model.contextLength }}
 {{- $flags = append $flags (printf "--context-length=%v" .) }}
@@ -98,11 +112,17 @@
   drain below have nothing to read. Do not repeat it in extraArgs.
 */}}
 {{- $flags = append $flags "--enable-metrics" }}
-{{- if $multi }}
+{{- /* The trio is only derived for a group that spans more than one node:
+       every non-pd multi-node role, and pd roles whose own size >= 2. At a pd
+       roleSize of 1 there is exactly one pod, so the flags would only restate
+       what the engine already knows. */}}
+{{- $trio := and $multi (or (not $pdRole) (gt (int ($roleCfg.size | default 1)) 1)) }}
+{{- if $trio }}
 {{- /*
   The three flags that make one SGLang instance span the group. They are derived,
-  not configured: nnodes IS lws.size (a group is the instance), the rank IS the
-  pod's position in the group, and the rendezvous address IS the leader. Anything
+  not configured: nnodes IS the group size (lws.size, or a pd role's own size;
+  a group is the instance), the rank IS the pod's position in the group, and the
+  rendezvous address IS the leader. Anything
   the chart cannot derive -- how those GPUs are carved up, i.e. --tp / --pp-size
   -- belongs in extraArgs, and the check in lws.yaml rejects restating these
   three there rather than letting two sources of truth disagree.
@@ -111,17 +131,415 @@
   group by the LWS controller; the leader is index 0 by definition, so it is
   written literally rather than read back from the env.
 */}}
-{{- $flags = append $flags (printf "--nnodes=%v" $lws.size) }}
+{{- $flags = append $flags (printf "--nnodes=%v" (ternary $roleCfg.size $lws.size $pdRole)) }}
 {{- $flags = append $flags (printf "--node-rank=%s" (ternary "${LWS_WORKER_INDEX}" "0" $worker)) }}
 {{- $expand = append $expand (last $flags) }}
-{{- $flags = append $flags (printf "--dist-init-addr=${LWS_LEADER_ADDRESS}:%v" $lws.distPort) }}
+{{- $flags = append $flags (printf "--dist-init-addr=${LWS_LEADER_ADDRESS}:%v" (ternary ($roleCfg.distPort | default $lws.distPort) $lws.distPort $pdRole)) }}
+{{- $expand = append $expand (last $flags) }}
+{{- end }}
+{{- if $pdRole }}
+{{- /* The mooncake wiring every pd engine carries. The mode is the role; the
+       bootstrap port is the role's own; and the ib-device comes from the env the
+       rdma-injector chain populates on THIS node. Double-quoted so bash expands
+       it -- passing the literal string would tell mooncake to open a device
+       named after a shell variable, which fails inside ibv, not at parse time. */}}
+{{- $flags = append $flags (printf "--disaggregation-mode=%s" (ternary "prefill" "decode" (hasPrefix "prefill-" $role))) }}
+{{- $flags = append $flags (printf "--disaggregation-transfer-backend=%s" $root.Values.pd.transferBackend) }}
+{{- $flags = append $flags (printf "--disaggregation-bootstrap-port=%v" ($roleCfg.bootstrapPort | default 8998)) }}
+{{- $flags = append $flags "--disaggregation-ib-device=${MOONCAKE_IB_DEVICE}" }}
 {{- $expand = append $expand (last $flags) }}
 {{- end }}
 {{- /* toString, so a YAML-typed entry (`- 8` under `- --tp`) reaches the pod as
        the string the API server requires rather than an int it rejects. */}}
 {{- range $root.Values.extraArgs }}
 {{- $flags = append $flags (toString .) }}
+{{- end }}
+{{- /* Role extraArgs append AFTER the top-level ones, so a repeated flag lands
+       last and wins -- SGLang takes the last occurrence. This is how a pd role
+       overrides a shared flag without the chart deduping. */}}
+{{- if $pdRole }}
+{{- range ($roleCfg.extraArgs | default list) }}
+{{- $flags = append $flags (toString .) }}
+{{- end }}
 {{- end -}}
+{{- toYaml (dict
+      "role" $role
+      "roleCfg" $roleCfg
+      "worker" $worker
+      "serves" $serves
+      "multi" $multi
+      "pdRole" $pdRole
+      "oc" $oc
+      "pname" $pname
+      "hwPort" $hwPort
+      "httpPort" $httpPort
+      "hasModel" $hasModel
+      "override" $override
+      "expand" $expand
+      "flags" $flags) -}}
+{{- end -}}
+
+{{/*
+  The engine's container list item, plus the hang-watcher sidecar that watches
+  it. Consumes the identity dict from sglang.engineIdentity (one source of
+  truth for the flags and the per-role ports). Emits list items ONLY -- no
+  `containers:` key -- so the colocate template can interleave its router
+  container between the two engines.
+
+  Call it as:  include "sglang.engineContainers" (dict "root" $ "role" "prefill-leader" "roleCfg" $cfg "colocate" true)
+*/}}
+{{- define "sglang.engineContainers" -}}
+{{- $root := .root }}
+{{- $e := fromYaml (include "sglang.engineIdentity" .) }}
+{{- $role := $e.role }}
+{{- $roleCfg := $e.roleCfg }}
+{{- $lws := $root.Values.lws }}
+{{- $multi := $e.multi }}
+{{- $pdRole := $e.pdRole }}
+{{- $worker := $e.worker }}
+{{- $serves := $e.serves }}
+{{- $oc := $e.oc }}
+{{- $pname := $e.pname }}
+{{- $hwPort := $e.hwPort }}
+{{- $httpPort := $e.httpPort }}
+{{- $hasModel := $e.hasModel }}
+{{- $override := $e.override }}
+{{- $expand := $e.expand }}
+{{- $flags := $e.flags }}
+{{- $preStop := $root.Values.lifecycle.preStop }}
+{{- /* /dev/shm: the chart mounts one unless the values already do. A user who
+       mounts /dev/shm through volumeMounts keeps ownership of it -- emitting
+       the chart's as well would put two mounts on the same path and the pod
+       spec would be rejected. */}}
+{{- $userShm := false }}
+{{- range $root.Values.volumeMounts }}
+{{- if eq (.mountPath | default "") "/dev/shm" }}{{ $userShm = true }}{{ end }}
+{{- end }}
+{{- $shmOn := and $root.Values.shm.enabled (not $userShm) }}
+- name: sglang{{ $oc }}
+  image: "{{ $root.Values.image.repository }}:{{ $root.Values.image.tag }}"
+  {{- if $override }}
+  {{- with $root.Values.commandOverride }}
+  command:
+    {{- range . }}
+    - {{ toString . | quote }}
+    {{- end }}
+  {{- end }}
+  {{- else if or $multi $pdRole }}
+  # Shell form on purpose -- see the header of this file. `exec` keeps SGLang as
+  # PID 1, which SIGTERM handling and the leader preStop below both depend on.
+  #
+  # ulimit -l lifts the locked-memory cap so the RDMA driver can pin its
+  # buffers; without it NCCL falls back to a slower path or fails outright on an
+  # IB fabric. Guarded, because a container without CAP_IPC_LOCK cannot raise it
+  # and that is not a reason to refuse to start.
+  #
+  # Every flag reaches the engine exactly as written. The ones the chart derives
+  # from the LWS environment (the rank and the leader's address) are
+  # double-quoted so bash expands their ${...}; everything else -- extraArgs
+  # included -- is single-quoted with any ' inside escaped, so spaces, quotes,
+  # $ and JSON survive the trip through bash untouched, the same as in the
+  # single-pod exec form. To reference the container's env from extraArgs, use
+  # Kubernetes' $(VAR) syntax: the kubelet expands it in either form.
+  command: ["bash", "-lc"]
+  args:
+    - |
+      ulimit -l unlimited 2>/dev/null || true
+      {{- if $pdRole }}
+      # The rdma-injector prepends `source /etc/gpu-node/nccl-ib.env`, so
+      # NCCL_IB_HCA is already the healthy IB set on THIS node. Mooncake wants
+      # the same answer; the flag below expands the env it is exported into.
+      export MOONCAKE_IB_DEVICE="${NCCL_IB_HCA}"
+      {{- end }}
+      exec sglang serve{{ range $flags }} \
+        {{ if has . $expand }}"{{ . }}"{{ else }}'{{ replace "'" "'\\''" . }}'{{ end }}{{ end }}
+  {{- else }}
+  command: ["sglang", "serve"]
+  args:
+    {{- range $flags }}
+    - {{ . | quote }}
+    {{- end }}
+  {{- end }}
+  env:
+    # false makes /health a plain status check. Left at SGLang's own
+    # default (true) it runs a real 1-token generation, sleeps at least 1s
+    # and can take 20s, which no sane probe timeout survives.
+    - name: SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION
+      value: {{ $root.Values.healthEndpointGeneration | quote }}
+    {{- if $root.Values.lifecycle.forceShutdown }}
+    # Makes SGLang skip its drain and exit as soon as SIGTERM arrives.
+    #
+    # Both spellings, because upstream renamed it and the two live side by side
+    # across the images in use: 0.5.10 still reads SGL_FORCE_SHUTDOWN but warns
+    # ("deprecated, please use SGLANG_FORCE_SHUTDOWN"), and 0.5.15 has dropped it
+    # entirely -- grep the package and the string is not there, so on 0.5.15 the
+    # old name alone is a no-op and this whole switch does nothing.
+    - name: SGLANG_FORCE_SHUTDOWN
+      value: "1"
+    - name: SGL_FORCE_SHUTDOWN
+      value: "1"
+    {{- end }}
+    {{- with $root.Values.env }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- if $serves }}
+  ports:
+  - containerPort: {{ $httpPort }}
+    name: {{ $pname }}
+  {{- end }}
+  {{- /* rdma.enabled adds IPC_LOCK to whatever securityContext says, so the
+         RDMA driver can pin its buffers (and the lws command form's
+         `ulimit -l unlimited` actually takes). Added once, never duplicated. */}}
+  {{- $sc := deepCopy ($root.Values.securityContext | default dict) }}
+  {{- if and $root.Values.rdma.enabled (or $multi $pdRole) }}
+  {{- $caps := $sc.capabilities | default dict }}
+  {{- $add := $caps.add | default list }}
+  {{- if not (has "IPC_LOCK" $add) }}
+  {{- $_ := set $caps "add" (append $add "IPC_LOCK") }}
+  {{- end }}
+  {{- $_ := set $sc "capabilities" $caps }}
+  {{- end }}
+  {{- with $sc }}
+  securityContext:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if or $hasModel $root.Values.volumeMounts $shmOn }}
+  volumeMounts:
+  {{- if $hasModel }}
+  - name: model-storage
+    mountPath: {{ $root.Values.model.mountPath }}
+    readOnly: true
+  {{- end }}
+  {{- if $shmOn }}
+  - name: dshm
+    mountPath: /dev/shm
+  {{- end }}
+  {{- with $root.Values.volumeMounts }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+  {{- end }}
+  {{- /* The GPU limit stays derived from model.gpus -- the one place this
+         chart names a GPU count -- and is merged over whatever else is in
+         .Values.resources, so cpu/memory/ephemeral-storage can be set
+         without restating it. A second way to say "2 GPUs" would only
+         drift, so naming it under resources is refused rather than
+         silently ignored.
+
+         nvidia.com/gpu is an extended resource: it belongs in limits
+         only, and the kubelet sets the request equal to it. Empty or 0
+         leaves the key out altogether rather than asking for zero of it. */}}
+  {{- $res := $root.Values.resources | default dict }}
+  {{- range $section := list "limits" "requests" }}
+  {{- if hasKey (index $res $section | default dict) "nvidia.com/gpu" }}
+  {{- fail (printf "sglang: set the GPU count with model.gpus, not resources.%s -- model.gpus is what renders nvidia.com/gpu and what the rest of the chart refers to" $section) }}
+  {{- end }}
+  {{- end }}
+  {{- $gpus := toString ($root.Values.model.gpus | default "") }}
+  {{- /* In colocate a pd role's own gpus wins, so the two engines split one
+         node's GPUs between them; empty falls back to model.gpus. Outside
+         colocate this is a no-op (roleCfg.gpus matches model.gpus). */}}
+  {{- if and $pdRole (ne (toString ($roleCfg.gpus | default "")) "") }}
+  {{- $gpus = toString $roleCfg.gpus }}
+  {{- end }}
+  {{- if not (or (eq $gpus "") (eq $gpus "0")) }}
+  {{- $res = mergeOverwrite (deepCopy $res) (dict "limits" (dict "nvidia.com/gpu" $gpus)) }}
+  {{- end }}
+  {{- /* rdma.enabled adds one RDMA device from the shared-device plugin
+         (rdma/hca_shared), unless resources already asks for it -- the user's
+         count stands. A null there counts as not asking: it is what a values
+         overlay leaves behind when it removes a hand-written entry, and the
+         point of such an overlay is to hand the job to this switch. */}}
+  {{- if and $root.Values.rdma.enabled (or $multi $pdRole) }}
+  {{- if kindIs "invalid" (index (index $res "limits" | default dict) "rdma/hca_shared") }}
+  {{- $res = mergeOverwrite (deepCopy $res) (dict "limits" (dict "rdma/hca_shared" "1")) }}
+  {{- end }}
+  {{- end }}
+  {{- with $res }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- /* No preStop on a worker: it serves nothing, so there is nothing to drain,
+         and it must stay in the NCCL group until the leader is done with it. */}}
+  {{- if and $preStop.enabled $serves }}
+  lifecycle:
+    preStop:
+      # Runs before SIGTERM, and its time counts against terminationGracePeriodSeconds.
+      # Written in python3 because that is what the container already runs, so it is always there -- the SGLang image ships no curl or wget. Needs no external drain API.
+      exec:
+        command:
+          - python3
+          - -c
+          # Whether the hook ends by killing SGLang itself is gated per role -- a group
+          # through lws.leaderPreStopKill, since there the kill additionally has to
+          # break a collective its workers have left; a single pod through
+          # lifecycle.preStopKill. Deliberately NOT lifecycle.forceShutdown: that one
+          # asks the engine to skip its drain, which is a statement about in-flight
+          # requests, while this is about what to do when the engine does not exit at
+          # all. Wanting the fallback without giving up the drain is a legitimate
+          # combination, so they stay separate switches.
+          - |
+            {{- include "sglang.preStopScript" (dict "root" $root "serves" $serves "kill" (ternary $lws.leaderPreStopKill $root.Values.lifecycle.preStopKill $multi) "httpPort" $httpPort "hwPort" $hwPort) | nindent 14 }}
+  {{- end }}
+  {{- if $serves }}
+  {{- with $root.Values.startupProbe }}
+  # While this is running the kubelet suppresses the other two probes, so a
+  # slow model load cannot trip a restart. Its
+  # failureThreshold x periodSeconds is the entire startup budget.
+  #
+  # Under LWS it covers more than a model load: the leader's port only binds
+  # once the whole group has finished the NCCL rendezvous, so this budget has
+  # to clear the slowest worker's start too.
+  startupProbe:
+    {{- if $pdRole }}
+    {{- include "sglang.probeOnPort" (dict "probe" . "port" $pname) | nindent 4 }}
+    {{- else }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+  {{- with $root.Values.readinessProbe }}
+  readinessProbe:
+    {{- if $pdRole }}
+    {{- include "sglang.probeOnPort" (dict "probe" . "port" $pname) | nindent 4 }}
+    {{- else }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+  {{- if $root.Values.hangWatcher.enabled }}
+  # hang-watcher owns liveness: probe the sidecar's /healthz on the shared
+  # pod network; a 503 (hang) restarts THIS container. Replaces the
+  # /health_generate check -- see hangWatcher in values.yaml for why.
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: {{ $hwPort }}
+    {{- with $root.Values.hangWatcher.livenessProbe }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- else }}
+  {{- with $root.Values.livenessProbe }}
+  livenessProbe:
+    {{- if $pdRole }}
+    {{- include "sglang.probeOnPort" (dict "probe" . "port" $pname) | nindent 4 }}
+    {{- else }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+{{- if and $root.Values.hangWatcher.enabled $serves }}
+# Hang-detection sidecar (see hangWatcher in values.yaml). Reads this pod's
+# own SGLang /metrics over localhost and serves /healthz for the engine's
+# livenessProbe above. Reports only; the kubelet does the restart. No RBAC.
+#
+# Worker pods do not get one: they run no HTTP server, so there are no metrics
+# to read -- and under RecreateGroupOnPodRestart a hung group is dealt with by
+# restarting the leader anyway, which takes the whole group with it.
+- name: hang-watcher{{ $oc }}
+  image: "{{ $root.Values.hangWatcher.image.repository }}:{{ $root.Values.hangWatcher.image.tag }}"
+  env:
+  - name: ENGINE_URL
+    value: "http://127.0.0.1:{{ $httpPort }}"
+  - name: LISTEN
+    value: ":{{ $hwPort }}"
+  - name: CONFIG_FILE
+    value: /etc/hang-watcher/config.json
+  {{- if (($root.Values.hangWatcher.config).logHang | default dict).enabled }}
+  # Log fast path. Containers in a pod do NOT share a filesystem, so "same pod"
+  # is not enough to read the engine's output: its stdout goes to the NODE, at
+  # /var/log/pods/<ns>_<pod>_<uid>/<container>/N.log. Hence the read-only hostPath
+  # below plus these two downward-API vars -- without them the glob would also match
+  # the sglang container of every OTHER pod on the node, and a neighbour's stall
+  # would get this pod restarted. The uid and the rotation index stay globs.
+  #
+  # (The alternative -- an emptyDir shared with the engine -- would need SGLang to
+  # write to a file, which it has no flag for; wrapping the command in a `tee` pipe
+  # would displace PID 1 and break the SIGTERM drain this chart relies on.)
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: POD_NS
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+  - name: LOG_FILE
+    value: "/var/log/pods/$(POD_NS)_$(POD_NAME)_*/sglang{{ $oc }}/*.log"
+  {{- with (($root.Values.hangWatcher.config).logHang | default dict).patterns }}
+  {{- /* Join the list into one RE2 alternation. Each entry is wrapped in (?:...)
+         so an entry that itself contains `|` stays self-contained instead of
+         merging with the next one. Empty list -> env omitted -> sidecar default. */}}
+  - name: LOG_HANG_PATTERN
+    value: {{ (printf "(?:%s)" (join ")|(?:" .)) | quote }}
+  {{- end }}
+  {{- end }}
+  ports:
+  - containerPort: {{ $hwPort }}
+    name: hang-hz{{ $oc }}
+  {{- with $root.Values.hangWatcher.readinessProbe }}
+  # Readiness on the sidecar itself: a hang verdict drops the POD out of the Service (an endpoint
+  # needs every container ready), so traffic stops arriving before the kill/drain even starts.
+  # The engine's own /v1/models readiness is untouched and still applies -- see values.yaml.
+  readinessProbe:
+    httpGet:
+      path: /healthz
+      port: {{ $hwPort }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  volumeMounts:
+  - name: hang-watcher-config
+    mountPath: /etc/hang-watcher
+    readOnly: true
+  {{- if (($root.Values.hangWatcher.config).logHang | default dict).enabled }}
+  - name: pod-logs
+    mountPath: /var/log/pods
+    readOnly: true
+  {{- end }}
+  {{- with $root.Values.hangWatcher.resources }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "sglang.podSpec" -}}
+{{- $root := .root }}
+{{- /* /dev/shm: the chart mounts one unless the values already do. A user who
+       mounts /dev/shm through volumeMounts keeps ownership of it -- emitting
+       the chart's as well would put two mounts on the same path and the pod
+       spec would be rejected. */}}
+{{- $userShm := false }}
+{{- range $root.Values.volumeMounts }}
+{{- if eq (.mountPath | default "") "/dev/shm" }}{{ $userShm = true }}{{ end }}
+{{- end }}
+{{- $shmOn := and $root.Values.shm.enabled (not $userShm) }}
+{{- /* A values file may already use the name this chart gives its /dev/shm
+       volume, for something else entirely. Two volumes cannot share a name, so
+       say so here rather than let the API server reject the pod with a message
+       that does not mention this chart. */}}
+{{- if $shmOn }}
+{{- range $root.Values.volumes }}
+{{- if eq (.name | default "") "dshm" }}
+{{- fail "volumes has an entry named \"dshm\", which is the name this chart gives the /dev/shm volume it adds by default. Rename that entry, or mount it at /dev/shm (the chart then leaves it alone), or set shm.enabled: false." }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- /* Colocate always renders the merged Deployment (pd-colocate.yaml); podSpec
+       is the one-engine pod, so it is always the non-colocate identity. */}}
+{{- $e := fromYaml (include "sglang.engineIdentity" (dict "root" $root "role" .role "roleCfg" (.roleCfg | default dict) "colocate" false)) }}
+{{- $role := $e.role }}
+{{- $roleCfg := $e.roleCfg }}
+{{- $lws := $root.Values.lws }}
+{{- $multi := $e.multi }}
+{{- $pdRole := $e.pdRole }}
+{{- $worker := $e.worker }}
+{{- $serves := $e.serves }}
+{{- $oc := $e.oc }}
+{{- $pname := $e.pname }}
+{{- $hwPort := $e.hwPort }}
+{{- $httpPort := $e.httpPort }}
+{{- $hasModel := $e.hasModel }}
+{{- $override := $e.override }}
+{{- $preStop := $root.Values.lifecycle.preStop }}
 {{- /* Shutdown budget: preStop + SGLang's post-SIGTERM drain, checked by
        sglang.shutdownBudget. Workers get their own, because they drain nothing
        and their whole group is being deleted with them -- a long grace only
@@ -134,8 +552,10 @@
 {{- $grace = $wg }}
 {{- end }}
 terminationGracePeriodSeconds: {{ $grace }}
-{{- /* Workers wait for the leader's rendezvous port; leaders wait for nothing. */}}
-{{- $waitLeader := and $worker $lws.waitForLeader }}
+{{- /* Workers wait for the leader's rendezvous port; leaders wait for nothing.
+       A pd size-1 role has no group to rendezvous with, so its sole pod waits
+       for nothing either. */}}
+{{- $waitLeader := and $worker $lws.waitForLeader (or (not $pdRole) (gt (int ($roleCfg.size | default 1)) 1)) }}
 {{- if or $root.Values.modelCheck.enabled $waitLeader }}
 initContainers:
 {{- if $root.Values.modelCheck.enabled }}
@@ -206,265 +626,7 @@ initContainers:
 {{- end }}
 {{- end }}
 containers:
-- name: sglang
-  image: "{{ $root.Values.image.repository }}:{{ $root.Values.image.tag }}"
-  {{- if $override }}
-  {{- with $cmd }}
-  command:
-    {{- range . }}
-    - {{ toString . | quote }}
-    {{- end }}
-  {{- end }}
-  {{- else if $multi }}
-  # Shell form on purpose -- see the header of this file. `exec` keeps SGLang as
-  # PID 1, which SIGTERM handling and the leader preStop below both depend on.
-  #
-  # ulimit -l lifts the locked-memory cap so the RDMA driver can pin its
-  # buffers; without it NCCL falls back to a slower path or fails outright on an
-  # IB fabric. Guarded, because a container without CAP_IPC_LOCK cannot raise it
-  # and that is not a reason to refuse to start.
-  #
-  # Every flag reaches the engine exactly as written. The ones the chart derives
-  # from the LWS environment (the rank and the leader's address) are
-  # double-quoted so bash expands their ${...}; everything else -- extraArgs
-  # included -- is single-quoted with any ' inside escaped, so spaces, quotes,
-  # $ and JSON survive the trip through bash untouched, the same as in the
-  # single-pod exec form. To reference the container's env from extraArgs, use
-  # Kubernetes' $(VAR) syntax: the kubelet expands it in either form.
-  command: ["bash", "-lc"]
-  args:
-    - |
-      ulimit -l unlimited 2>/dev/null || true
-      exec sglang serve{{ range $flags }} \
-        {{ if has . $expand }}"{{ . }}"{{ else }}'{{ replace "'" "'\\''" . }}'{{ end }}{{ end }}
-  {{- else }}
-  command: ["sglang", "serve"]
-  args:
-    {{- range $flags }}
-    - {{ . | quote }}
-    {{- end }}
-  {{- end }}
-  env:
-    # false makes /health a plain status check. Left at SGLang's own
-    # default (true) it runs a real 1-token generation, sleeps at least 1s
-    # and can take 20s, which no sane probe timeout survives.
-    - name: SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION
-      value: {{ $root.Values.healthEndpointGeneration | quote }}
-    {{- if $root.Values.lifecycle.forceShutdown }}
-    # Makes SGLang skip its drain and exit as soon as SIGTERM arrives.
-    #
-    # Both spellings, because upstream renamed it and the two live side by side
-    # across the images in use: 0.5.10 still reads SGL_FORCE_SHUTDOWN but warns
-    # ("deprecated, please use SGLANG_FORCE_SHUTDOWN"), and 0.5.15 has dropped it
-    # entirely -- grep the package and the string is not there, so on 0.5.15 the
-    # old name alone is a no-op and this whole switch does nothing.
-    - name: SGLANG_FORCE_SHUTDOWN
-      value: "1"
-    - name: SGL_FORCE_SHUTDOWN
-      value: "1"
-    {{- end }}
-    {{- with $root.Values.env }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
-  {{- if $serves }}
-  ports:
-  - containerPort: {{ $root.Values.service.port }}
-    name: http
-  {{- end }}
-  {{- /* rdma.enabled adds IPC_LOCK to whatever securityContext says, so the
-         RDMA driver can pin its buffers (and the lws command form's
-         `ulimit -l unlimited` actually takes). Added once, never duplicated. */}}
-  {{- $sc := deepCopy ($root.Values.securityContext | default dict) }}
-  {{- if and $root.Values.rdma.enabled $multi }}
-  {{- $caps := $sc.capabilities | default dict }}
-  {{- $add := $caps.add | default list }}
-  {{- if not (has "IPC_LOCK" $add) }}
-  {{- $_ := set $caps "add" (append $add "IPC_LOCK") }}
-  {{- end }}
-  {{- $_ := set $sc "capabilities" $caps }}
-  {{- end }}
-  {{- with $sc }}
-  securityContext:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-  {{- if or $hasModel $root.Values.volumeMounts $shmOn }}
-  volumeMounts:
-  {{- if $hasModel }}
-  - name: model-storage
-    mountPath: {{ $root.Values.model.mountPath }}
-    readOnly: true
-  {{- end }}
-  {{- if $shmOn }}
-  - name: dshm
-    mountPath: /dev/shm
-  {{- end }}
-  {{- with $root.Values.volumeMounts }}
-  {{- toYaml . | nindent 2 }}
-  {{- end }}
-  {{- end }}
-  {{- /* The GPU limit stays derived from model.gpus -- the one place this
-         chart names a GPU count -- and is merged over whatever else is in
-         .Values.resources, so cpu/memory/ephemeral-storage can be set
-         without restating it. A second way to say "2 GPUs" would only
-         drift, so naming it under resources is refused rather than
-         silently ignored.
-
-         nvidia.com/gpu is an extended resource: it belongs in limits
-         only, and the kubelet sets the request equal to it. Empty or 0
-         leaves the key out altogether rather than asking for zero of it. */}}
-  {{- $res := $root.Values.resources | default dict }}
-  {{- range $section := list "limits" "requests" }}
-  {{- if hasKey (index $res $section | default dict) "nvidia.com/gpu" }}
-  {{- fail (printf "sglang: set the GPU count with model.gpus, not resources.%s -- model.gpus is what renders nvidia.com/gpu and what the rest of the chart refers to" $section) }}
-  {{- end }}
-  {{- end }}
-  {{- $gpus := toString ($root.Values.model.gpus | default "") }}
-  {{- if not (or (eq $gpus "") (eq $gpus "0")) }}
-  {{- $res = mergeOverwrite (deepCopy $res) (dict "limits" (dict "nvidia.com/gpu" $gpus)) }}
-  {{- end }}
-  {{- /* rdma.enabled adds one RDMA device from the shared-device plugin
-         (rdma/hca_shared), unless resources already asks for it -- the user's
-         count stands. A null there counts as not asking: it is what a values
-         overlay leaves behind when it removes a hand-written entry, and the
-         point of such an overlay is to hand the job to this switch. */}}
-  {{- if and $root.Values.rdma.enabled $multi }}
-  {{- if kindIs "invalid" (index (index $res "limits" | default dict) "rdma/hca_shared") }}
-  {{- $res = mergeOverwrite (deepCopy $res) (dict "limits" (dict "rdma/hca_shared" "1")) }}
-  {{- end }}
-  {{- end }}
-  {{- with $res }}
-  resources:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-  {{- /* No preStop on a worker: it serves nothing, so there is nothing to drain,
-         and it must stay in the NCCL group until the leader is done with it. */}}
-  {{- if and $preStop.enabled $serves }}
-  lifecycle:
-    preStop:
-      # Runs before SIGTERM, and its time counts against terminationGracePeriodSeconds.
-      # Written in python3 because that is what the container already runs, so it is always there -- the SGLang image ships no curl or wget. Needs no external drain API.
-      exec:
-        command:
-          - python3
-          - -c
-          # Whether the hook ends by killing SGLang itself is gated per role -- a group
-          # through lws.leaderPreStopKill, since there the kill additionally has to
-          # break a collective its workers have left; a single pod through
-          # lifecycle.preStopKill. Deliberately NOT lifecycle.forceShutdown: that one
-          # asks the engine to skip its drain, which is a statement about in-flight
-          # requests, while this is about what to do when the engine does not exit at
-          # all. Wanting the fallback without giving up the drain is a legitimate
-          # combination, so they stay separate switches.
-          - |
-            {{- include "sglang.preStopScript" (dict "root" $root "serves" $serves "kill" (ternary $lws.leaderPreStopKill $root.Values.lifecycle.preStopKill $multi)) | nindent 14 }}
-  {{- end }}
-  {{- if $serves }}
-  {{- with $root.Values.startupProbe }}
-  # While this is running the kubelet suppresses the other two probes, so a
-  # slow model load cannot trip a restart. Its
-  # failureThreshold x periodSeconds is the entire startup budget.
-  #
-  # Under LWS it covers more than a model load: the leader's port only binds
-  # once the whole group has finished the NCCL rendezvous, so this budget has
-  # to clear the slowest worker's start too.
-  startupProbe:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-  {{- with $root.Values.readinessProbe }}
-  readinessProbe:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-  {{- if $root.Values.hangWatcher.enabled }}
-  # hang-watcher owns liveness: probe the sidecar's /healthz on the shared
-  # pod network; a 503 (hang) restarts THIS container. Replaces the
-  # /health_generate check -- see hangWatcher in values.yaml for why.
-  livenessProbe:
-    httpGet:
-      path: /healthz
-      port: {{ $root.Values.hangWatcher.port }}
-    {{- with $root.Values.hangWatcher.livenessProbe }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
-  {{- else }}
-  {{- with $root.Values.livenessProbe }}
-  livenessProbe:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-  {{- end }}
-  {{- end }}
-{{- if and $root.Values.hangWatcher.enabled $serves }}
-# Hang-detection sidecar (see hangWatcher in values.yaml). Reads this pod's
-# own SGLang /metrics over localhost and serves /healthz for the engine's
-# livenessProbe above. Reports only; the kubelet does the restart. No RBAC.
-#
-# Worker pods do not get one: they run no HTTP server, so there are no metrics
-# to read -- and under RecreateGroupOnPodRestart a hung group is dealt with by
-# restarting the leader anyway, which takes the whole group with it.
-- name: hang-watcher
-  image: "{{ $root.Values.hangWatcher.image.repository }}:{{ $root.Values.hangWatcher.image.tag }}"
-  env:
-  - name: ENGINE_URL
-    value: "http://127.0.0.1:{{ $root.Values.service.port }}"
-  - name: LISTEN
-    value: ":{{ $root.Values.hangWatcher.port }}"
-  - name: CONFIG_FILE
-    value: /etc/hang-watcher/config.json
-  {{- if (($root.Values.hangWatcher.config).logHang | default dict).enabled }}
-  # Log fast path. Containers in a pod do NOT share a filesystem, so "same pod"
-  # is not enough to read the engine's output: its stdout goes to the NODE, at
-  # /var/log/pods/<ns>_<pod>_<uid>/<container>/N.log. Hence the read-only hostPath
-  # below plus these two downward-API vars -- without them the glob would also match
-  # the sglang container of every OTHER pod on the node, and a neighbour's stall
-  # would get this pod restarted. The uid and the rotation index stay globs.
-  #
-  # (The alternative -- an emptyDir shared with the engine -- would need SGLang to
-  # write to a file, which it has no flag for; wrapping the command in a `tee` pipe
-  # would displace PID 1 and break the SIGTERM drain this chart relies on.)
-  - name: POD_NAME
-    valueFrom:
-      fieldRef:
-        fieldPath: metadata.name
-  - name: POD_NS
-    valueFrom:
-      fieldRef:
-        fieldPath: metadata.namespace
-  - name: LOG_FILE
-    value: "/var/log/pods/$(POD_NS)_$(POD_NAME)_*/sglang/*.log"
-  {{- with (($root.Values.hangWatcher.config).logHang | default dict).patterns }}
-  {{- /* Join the list into one RE2 alternation. Each entry is wrapped in (?:...)
-         so an entry that itself contains `|` stays self-contained instead of
-         merging with the next one. Empty list -> env omitted -> sidecar default. */}}
-  - name: LOG_HANG_PATTERN
-    value: {{ (printf "(?:%s)" (join ")|(?:" .)) | quote }}
-  {{- end }}
-  {{- end }}
-  ports:
-  - containerPort: {{ $root.Values.hangWatcher.port }}
-    name: hang-hz
-  {{- with $root.Values.hangWatcher.readinessProbe }}
-  # Readiness on the sidecar itself: a hang verdict drops the POD out of the Service (an endpoint
-  # needs every container ready), so traffic stops arriving before the kill/drain even starts.
-  # The engine's own /v1/models readiness is untouched and still applies -- see values.yaml.
-  readinessProbe:
-    httpGet:
-      path: /healthz
-      port: {{ $root.Values.hangWatcher.port }}
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-  volumeMounts:
-  - name: hang-watcher-config
-    mountPath: /etc/hang-watcher
-    readOnly: true
-  {{- if (($root.Values.hangWatcher.config).logHang | default dict).enabled }}
-  - name: pod-logs
-    mountPath: /var/log/pods
-    readOnly: true
-  {{- end }}
-  {{- with $root.Values.hangWatcher.resources }}
-  resources:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-{{- end }}
+{{- include "sglang.engineContainers" (dict "root" $root "role" .role "roleCfg" (.roleCfg | default dict) "colocate" false) }}
 {{- $hangVol := and $root.Values.hangWatcher.enabled $serves }}
 {{- if or $hasModel $hangVol $root.Values.volumes $shmOn }}
 volumes:
@@ -501,7 +663,16 @@ hostNetwork: true
 {{- with (ternary "ClusterFirstWithHostNet" $root.Values.dnsPolicy (and $root.Values.hostNetwork (not $root.Values.dnsPolicy))) }}
 dnsPolicy: {{ . }}
 {{- end }}
-{{- with $root.Values.schedulerName }}
+{{- /* A pd role's schedulerName / affinity fully REPLACES the top-level one
+       (never merges): the two roles of a PD set often need to land on different
+       GPU products, which affinities cannot express by union. NodeSelector gets
+       no per-role override -- flat maps do not compose, and per-role nodeSelector
+       degenerates into per-node pinning. */}}
+{{- $sched := $root.Values.schedulerName }}
+{{- if and $pdRole ($roleCfg.schedulerName | default "") }}
+{{- $sched = $roleCfg.schedulerName }}
+{{- end }}
+{{- with $sched }}
 schedulerName: {{ . }}
 {{- end }}
 {{- with $root.Values.priorityClassName }}
@@ -511,7 +682,11 @@ priorityClassName: {{ . }}
 nodeSelector:
   {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with $root.Values.affinity }}
+{{- $aff := $root.Values.affinity }}
+{{- if and $pdRole (not (kindIs "invalid" $roleCfg.affinityReplace)) ($roleCfg.affinityReplace) }}
+{{- $aff = $roleCfg.affinityReplace }}
+{{- end }}
+{{- with $aff }}
 affinity:
   {{- toYaml . | nindent 2 }}
 {{- end }}
@@ -535,6 +710,22 @@ affinity:
 tolerations:
   {{- toYaml . | nindent 2 }}
 {{- end }}
+{{- end -}}
+
+{{/*
+  Rewrite a probe's httpGet.port onto a numeric port. pd roles serve on their
+  own httpPort, so a probe values.yaml wrote against the default `http` name /
+  service.port has to be pointed at the role's port. Everything else in the
+  probe passes through unchanged. Non-pd callers never invoke this.
+*/}}
+{{- define "sglang.probeOnPort" -}}
+{{- $probe := deepCopy .probe }}
+{{- if hasKey $probe "httpGet" }}
+{{- $hg := deepCopy $probe.httpGet }}
+{{- $_ := set $hg "port" .port }}
+{{- $_ := set $probe "httpGet" $hg }}
+{{- end }}
+{{- toYaml $probe }}
 {{- end -}}
 
 {{/*
@@ -582,9 +773,13 @@ tolerations:
 {{- /* ~30s of consecutive unreadable metrics, whatever the poll interval. */ -}}
 {{- $streak := max 3 (div 30 $poll) -}}
 {{- $streakSecs := mul $streak $poll -}}
+{{- /* pd roles serve on their own port; empty httpPort falls back to
+       service.port, keeping the non-pd drain unchanged. */ -}}
+{{- $httpPort := .httpPort | default $root.Values.service.port -}}
+{{- $hwPort := .hwPort | default $root.Values.hangWatcher.port -}}
 import time, urllib.request, urllib.error{{ if .kill }}, os, signal{{ end }}
 
-METRICS = "http://127.0.0.1:{{ $root.Values.service.port }}/metrics"
+METRICS = "http://127.0.0.1:{{ $httpPort }}/metrics"
 # What SGLang is working on right now, plus what is queued up.
 # These names are SGLang's own -- vLLM calls them
 # vllm:num_requests_running / vllm:num_requests_waiting.
@@ -642,7 +837,7 @@ time.sleep({{ $preStop.endpointSyncSeconds }})
 {{- if $askWatcher }}
 
 
-HEALTHZ = "http://127.0.0.1:{{ $root.Values.hangWatcher.port }}/healthz"
+HEALTHZ = "http://127.0.0.1:{{ $hwPort }}/healthz"
 
 
 def hung():
