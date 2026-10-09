@@ -613,7 +613,10 @@ initContainers:
     - |
       set -u
       leader="${LWS_LEADER_ADDRESS:-${POD_NAME%-*}.{{ ternary "${POD_NAME%-*}" (include "sglang.fullname" $root) (eq $lws.subdomainPolicy "UniquePerReplica") }}}"
-      port={{ $lws.distPort }}
+      {{- /* Under pd a role can override distPort; the wait has to hit the same
+             port --dist-init-addr pointed at, not the lws-wide default. Outside
+             pd this falls back to lws.distPort, matching pre-pd renders. */}}
+      port={{ $roleCfg.distPort | default $lws.distPort }}
       echo "wait-leader: waiting for the group leader at ${leader}:${port}"
       i=0
       until timeout 5 bash -c "exec 3<>/dev/tcp/${leader}/${port}" 2>/dev/null; do
