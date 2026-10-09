@@ -336,9 +336,13 @@
   {{- end }}
   {{- $gpus := toString ($root.Values.model.gpus | default "") }}
   {{- /* In colocate a pd role's own gpus wins, so the two engines split one
-         node's GPUs between them; empty falls back to model.gpus. Outside
-         colocate this is a no-op (roleCfg.gpus matches model.gpus). */}}
-  {{- if and $pdRole (ne (toString ($roleCfg.gpus | default "")) "") }}
+         node's GPUs between them; unset or empty-string falls back to
+         model.gpus. Detect set-ness with kindIs + toString, not with sprig
+         `default`, because `default` treats integer 0 as empty and would
+         silently rewrite `gpus: 0` to the fallback -- losing a GPU-less
+         role. Outside colocate this is a no-op (roleCfg.gpus matches
+         model.gpus). */}}
+  {{- if and $pdRole (not (kindIs "invalid" $roleCfg.gpus)) (ne (toString $roleCfg.gpus) "") }}
   {{- $gpus = toString $roleCfg.gpus }}
   {{- end }}
   {{- if not (or (eq $gpus "") (eq $gpus "0")) }}

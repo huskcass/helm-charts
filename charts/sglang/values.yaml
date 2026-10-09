@@ -176,8 +176,10 @@ pd:
     distPort: ""
     # GPUs THIS role's engine claims per pod or container. A/B: per pod of
     # the group (so TP=16-across-2 nodes is size: 2 + gpus: 8). Colocate:
-    # this container's share of the merged pod's node. Undefined falls back
-    # to top-level model.gpus.
+    # this container's share of the merged pod's node. Required under
+    # pd.enabled (the two roles rarely want the same count, and in colocate
+    # inheriting model.gpus would double-claim the node); a GPU-less role
+    # sets 0. Outside pd the engine falls back to top-level model.gpus.
     gpus: ""
     extraArgs: []
     affinityReplace: null

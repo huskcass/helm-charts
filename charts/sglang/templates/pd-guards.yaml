@@ -74,15 +74,21 @@
        (a 1P1D pattern usually splits 8 as 4/4 or 6/2, not 8/8), and in
        colocate the merged pod would claim model.gpus twice if both roles
        fell through (each engine reads the same default when its own gpus
-       is empty). Force the user to say what they mean per role, and to
-       leave model.gpus empty so there is one source of truth per engine.
-       A role with no GPU claim sets its gpus to "0", which is a real
-       value, not empty. */ -}}
-{{- $modelGpus := toString (.Values.model.gpus | default "") -}}
-{{- $pfGpus := toString ($pd.prefill.gpus | default "") -}}
-{{- $dcGpus := toString ($pd.decode.gpus | default "") -}}
-{{- if or (eq $pfGpus "") (eq $dcGpus "") (ne $modelGpus "") -}}
-{{- fail (printf "sglang: pd.enabled requires an explicit per-role GPU split -- set pd.prefill.gpus and pd.decode.gpus, and leave model.gpus empty. (model.gpus=%q, pd.prefill.gpus=%q, pd.decode.gpus=%q.) The two roles rarely want the same number, and in colocate model.gpus would be claimed twice; say what you mean per role. A role with no GPU claim sets its gpus to \"0\", which is a real value, not empty." $modelGpus $pfGpus $dcGpus) -}}
+       is empty). Force the user to say what they mean per role.
+
+       Set means "the key is present and not the empty string" -- detected
+       via kindIs + toString, not via sprig `default`, because sprig treats
+       integer 0 as empty and would silently rewrite `gpus: 0` to unset.
+       0 and "0" are real claims (a GPU-less role stays expressible);
+       only a missing key or an explicit empty string reads as unset.
+
+       model.gpus is deliberately NOT inspected here. Once both roles
+       override it, the fallback is dead config under pd -- the per-role
+       value is what _pod.tpl reads for every pd pod. */ -}}
+{{- $pfSet := and (not (kindIs "invalid" $pd.prefill.gpus)) (ne (toString $pd.prefill.gpus) "") -}}
+{{- $dcSet := and (not (kindIs "invalid" $pd.decode.gpus)) (ne (toString $pd.decode.gpus) "") -}}
+{{- if not (and $pfSet $dcSet) -}}
+{{- fail (printf "sglang: pd.enabled requires an explicit per-role GPU split -- set pd.prefill.gpus and pd.decode.gpus. (pd.prefill.gpus=%v, pd.decode.gpus=%v.) The two roles rarely want the same number, and in colocate both would otherwise inherit model.gpus and double-claim the node. A GPU-less role sets gpus to 0 or \"0\" -- a real claim, not empty." $pd.prefill.gpus $pd.decode.gpus) -}}
 {{- end -}}
 
 {{- /* Colocate is 1P1D inside a merged pod in v1: one prefill container, one
