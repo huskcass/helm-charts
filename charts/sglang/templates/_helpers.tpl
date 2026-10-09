@@ -81,7 +81,7 @@
 */}}
 {{- define "sglang.podLabels" -}}
 {{- $labels := deepCopy (.Values.podLabels | default dict) -}}
-{{- if and .Values.rdma.enabled .Values.lws.enabled -}}
+{{- if and .Values.rdma.enabled (or .Values.lws.enabled .Values.pd.enabled) -}}
 {{- $labels = merge $labels (dict "rdma-ib" "true") -}}
 {{- end -}}
 {{- with $labels }}{{ toYaml . }}{{ end -}}

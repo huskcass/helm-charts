@@ -80,6 +80,143 @@ lws:
       maxSurge: 1
       maxUnavailable: 0
 
+# Prefill/decode-disaggregated serving, in place of the engine above. The two
+# are mutually exclusive -- turning pd.enabled on suppresses both the
+# Deployment (all shapes) and the plain LeaderWorkerSet (its lws.enabled=false
+# branch), and renders one of:
+#
+#   colocate: false   a DisaggregatedSet (disaggregatedset.x-k8s.io/v1) with
+#                     one prefill role and one decode role, plus per-slice
+#                     router pods. Each role's leaderWorkerTemplate.size
+#                     reuses the same grouping axis as lws.size: 1 = one pod
+#                     per engine (the whole model over NVLink on one node),
+#                     >=2 = a multi-node group per engine (mooncake over IB
+#                     between groups' leaders, cross-node NCCL inside a
+#                     group). replicaCount becomes spec.slices -- N
+#                     independent copies of the whole role pair, each with
+#                     its own router.
+#   colocate: true    a single Deployment whose pod carries BOTH engines as
+#                     containers (plus the router as a third), sharing one
+#                     netns and one node's GPUs. replicaCount is ordinary
+#                     Deployment replicas: N self-contained appliances, each
+#                     its own router. No DisaggregatedSet anywhere.
+#
+# One release = one PD configuration. CART, the ModelRoute, monitor and
+# openresty stay intact: the chart's front door moves to
+# <release>-router:<service.port> and they follow through sglang.serviceName,
+# so their values need no pd awareness.
+#
+# The port table is the same in every shape and worth learning once:
+#
+#   listener                    port   where set
+#   router (public)            30000   service.port -- what CART/monitor curl
+#   prefill engine http        30001   pd.<role>.httpPort
+#   decode  engine http        30002   pd.<role>.httpPort
+#   prefill mooncake bootstrap  8998   pd.<role>.bootstrapPort
+#   decode  mooncake bootstrap  8999   pd.<role>.bootstrapPort
+#
+# Splitting ports everywhere, not just in colocate where one netns forces it,
+# keeps the shapes identical to operate on. A render-time guard fails if the
+# three http ports are not pairwise distinct; the bootstrap pair diverges by
+# default (8998/8999) so colocate needs nothing special.
+#
+# extraArgs ordering for engines is chart-derived flags, then top-level
+# extraArgs, then pd.<role>.extraArgs, LAST occurrence of a repeated flag
+# winning. So role flags override the shared ones by construction: a common
+# --dist-timeout=1800 can live at top level while --mem-fraction-static
+# differs per role. As with lws, --nnodes / --node-rank / --dist-init-addr
+# belong to the chart and are rejected anywhere in extraArgs.
+#
+# Things the render-time guards turn down, with reasons in the templates:
+#   lws.enabled + pd.enabled, pd + commandOverride, pd + scaler.enabled,
+#   pd + rdma.enabled=false (the roles speak mooncake over IB; RDMA-on is
+#   part of what pd renders, not a knob under it).
+
+pd:
+  enabled: false
+  colocate: false
+  transferBackend: mooncake       # only mooncake today
+
+  # The two roles. A/B roles render one leaderWorkerTemplate each; colocate
+  # renders one CONTAINER each inside the merged pod (and ignores everything
+  # that is fundamentally a per-pod or per-copy setting).
+  #
+  # Per-role fields that REPLACE the top-level one when set:
+  #   extraArgs       appended after the top-level extraArgs for this role's
+  #                   engines (last-wins, see elsewhere in this file).
+  #   affinityReplace full replacement of top-level affinity for this role's
+  #                   pods. Use it to pin prefill to one GPU product and let
+  #                   decode float, or the reverse.
+  #   schedulerName   full replacement of top-level schedulerName (e.g.
+  #                   volcano on a DS role; colocate never renders volcano
+  #                   itself).
+  # Anything not overridden falls through to the top-level value.
+  prefill:
+    # A/B only. Copies of this role PER SLICE on the DisaggregatedSet;
+    # pd-guards rejects anything other than 1 under pd.colocate (v1 renders
+    # exactly one prefill container per merged pod -- replicas there is
+    # replicaCount, never this).
+    replicas: 1
+    # A/B only. Pods per group for this role: 1 = one engine per pod (the
+    # lws.size=1 pattern), >=2 = a multi-node group per engine (nnodes /
+    # node-rank / dist-init-addr derived exactly as in lws).
+    size: 1
+    # The engine's --port in every shape. Container-level in colocate.
+    httpPort: 30001
+    # Where this role's prefill instance listens for the mooncake bootstrap
+    # handshake the router gives the decode role. The same port is handed to
+    # the router as --prefill URL PORT -- always explicit, never let smg
+    # default it (the default traps the decode side into connecting to its
+    # own port).
+    bootstrapPort: 8998
+    # A/B + size >= 2 only: the rendezvous port the group's leader listens on
+    # for --dist-init-addr, exactly as lws.distPort is for lws. Empty falls
+    # back to top-level lws.distPort. Colocate and size-1 roles render no
+    # --dist-init-addr at all, so this is a no-op there.
+    distPort: ""
+    # GPUs THIS role's engine claims per pod or container. A/B: per pod of
+    # the group (so TP=16-across-2 nodes is size: 2 + gpus: 8). Colocate:
+    # this container's share of the merged pod's node. Required under
+    # pd.enabled (the two roles rarely want the same count, and in colocate
+    # inheriting model.gpus would double-claim the node); a GPU-less role
+    # sets 0. Outside pd the engine falls back to top-level model.gpus.
+    gpus: ""
+    extraArgs: []
+    affinityReplace: null
+    schedulerName: ""
+  decode:
+    replicas: 1
+    size: 1
+    httpPort: 30002
+    bootstrapPort: 8999
+    distPort: ""
+    gpus: ""
+    extraArgs: []
+    affinityReplace: null
+    schedulerName: ""
+
+  router:
+    # A/B only. In colocate there is exactly one router CONTAINER per
+    # merged pod; this replicas is the per-slice router Deployment count
+    # (1, capped at 2 -- this image's sglang-router has no HA).
+    replicas: 1
+    # Forwarded verbatim as --policy.
+    policy: cache_aware
+    # Default: the engine image (which ships sglang_router). Set
+    # imageOverride.repository / .tag to run the router off a different
+    # build. The merged pod in colocate uses the same image for its router
+    # CONTAINER and for both engines unless this says otherwise.
+    imageOverride:
+      repository: ""
+      tag: ""
+    # The router always gets a copy of the model mounted read-only at
+    # model.mountPath (as /model for the tokenizer's HF lookup, the path
+    # cache_aware's prefix-hashing needs) and inherits the engines'
+    # scheduling by default. The *Replace fields fully swap the top-level
+    # blocks rather than merge.
+    affinityReplace: null
+    tolerationsReplace: null
+
 image:
   repository: "lmsysorg/sglang"
   tag: "latest"

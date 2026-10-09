@@ -1,0 +1,105 @@
+{{- /* Render-time guards for pd, in one additive file so the pd incompatibilities
+       are enumerable in a single place. Each check fails the `helm template`
+       rather than let a silently-broken combination reach the cluster. Renders
+       nothing. */ -}}
+{{- if .Values.pd.enabled -}}
+{{- include "sglang.pdGuards" . -}}
+{{- end -}}
+
+{{- define "sglang.pdGuards" -}}
+{{- $pd := .Values.pd -}}
+
+{{- /* Two alternative multi-node forms of the same engine: pd renders its own
+       DisaggregatedSet, lws renders a plain LeaderWorkerSet. They cannot both
+       own the release. */ -}}
+{{- if .Values.lws.enabled -}}
+{{- fail "sglang: lws.enabled and pd.enabled are alternative multi-node forms. pd renders its own DisaggregatedSet (and suppresses the plain lws and the Deployment); turn lws.enabled off." -}}
+{{- end -}}
+
+{{- /* The PD carried here speaks mooncake over IB. The RDMA triple
+       (IPC_LOCK + rdma/hca_shared + the rdma-ib label's nccl-ib.env source) is
+       part of what pd renders on every engine, not a knob under it -- the
+       engines fail deep inside ibv without it. */ -}}
+{{- if not .Values.rdma.enabled -}}
+{{- fail "sglang: pd.enabled requires rdma.enabled -- the PD roles speak mooncake over IB, and rdma.enabled is what sets IPC_LOCK + rdma/hca_shared + the rdma-ib injector label on every engine pod. There is no pd-over-TCP path in this chart." -}}
+{{- end -}}
+
+{{- /* commandOverride replaces the engine command line the chart appends the
+       disaggregation flags to; the role contract (a prefill and a decode role
+       differing only by --disaggregation-mode) would break silently. */ -}}
+{{- if not (kindIs "invalid" .Values.commandOverride) -}}
+{{- fail "sglang: pd.enabled and commandOverride do not compose -- the roles differ only by the --disaggregation-mode flag the chart derives, and commandOverride replaces that whole line. Model the two roles in values, or drop pd and override a single engine." -}}
+{{- end -}}
+
+{{- /* Scaling a PD set is a per-role decision (the prefill:decode ratio is the
+       point), one scaler targets one subresource, and the per-role LWS objects
+       rotate revision-hash names per roll -- a targetRef would dangle. */ -}}
+{{- if .Values.scaler.enabled -}}
+{{- fail "sglang: pd.enabled and scaler.enabled do not compose in v1. Scaling a PD set is per-role (prefill:decode ratio), and the per-role LWS names rotate per rollout so a targetRef would dangle. Resize by editing pd.prefill/decode.replicas and applying." -}}
+{{- end -}}
+
+{{- /* The three engine HTTP listeners can share one netns (colocate), and even
+       in A/B they must not collide -- so require pairwise-distinct ports up
+       front rather than a listen error at engine start. */ -}}
+{{- $p1 := int (.Values.pd.prefill.httpPort | default 30001) -}}
+{{- $p2 := int (.Values.pd.decode.httpPort | default 30002) -}}
+{{- $p3 := int .Values.service.port -}}
+{{- if or (eq $p1 $p2) (eq $p1 $p3) (eq $p2 $p3) -}}
+{{- fail (printf "sglang: pd engine http ports must be pairwise distinct (service.port=%d, pd.prefill.httpPort=%d, pd.decode.httpPort=%d). In colocate they share one netns; in every shape they must not collide." $p3 $p1 $p2) -}}
+{{- end -}}
+
+{{- /* The rank trio is derived per pod by the chart; restating it in any
+       extraArgs overrides the per-pod value (SGLang takes the LAST occurrence),
+       which is the silent wrong-cluster bug, not a preference. */ -}}
+{{- range $roleCfg := list .Values.pd.prefill .Values.pd.decode -}}
+{{- range $arg := ($roleCfg.extraArgs | default list) -}}
+{{- range $derived := list "--nnodes" "--node-rank" "--dist-init-addr" -}}
+{{- if hasPrefix $derived (toString $arg) -}}
+{{- fail (printf "sglang: a pd role's extraArgs carries %q, which the chart already derives per pod (nnodes=role size, node-rank per pod, dist-init-addr from the leader). SGLang takes the LAST occurrence, so this would override the per-pod value. Drop it." $arg) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $arg := .Values.extraArgs -}}
+{{- range $derived := list "--nnodes" "--node-rank" "--dist-init-addr" -}}
+{{- if hasPrefix $derived (toString $arg) -}}
+{{- fail (printf "sglang: extraArgs carries %q, which pd derives per pod (nnodes=role size, node-rank per pod, dist-init-addr from the leader). SGLang takes the LAST occurrence, so this would override the per-pod value. Drop it." $arg) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* The GPU claim has to be explicit per role in every pd shape, not
+       just colocate. There is no "right" default a role should inherit
+       from the top level: prefill and decode rarely want the same count
+       (a 1P1D pattern usually splits 8 as 4/4 or 6/2, not 8/8), and in
+       colocate the merged pod would claim model.gpus twice if both roles
+       fell through (each engine reads the same default when its own gpus
+       is empty). Force the user to say what they mean per role.
+
+       Set means "the key is present and not the empty string" -- detected
+       via kindIs + toString, not via sprig `default`, because sprig treats
+       integer 0 as empty and would silently rewrite `gpus: 0` to unset.
+       0 and "0" are real claims (a GPU-less role stays expressible);
+       only a missing key or an explicit empty string reads as unset.
+
+       model.gpus is deliberately NOT inspected here. Once both roles
+       override it, the fallback is dead config under pd -- the per-role
+       value is what _pod.tpl reads for every pd pod. */ -}}
+{{- $pfSet := and (not (kindIs "invalid" $pd.prefill.gpus)) (ne (toString $pd.prefill.gpus) "") -}}
+{{- $dcSet := and (not (kindIs "invalid" $pd.decode.gpus)) (ne (toString $pd.decode.gpus) "") -}}
+{{- if not (and $pfSet $dcSet) -}}
+{{- fail (printf "sglang: pd.enabled requires an explicit per-role GPU split -- set pd.prefill.gpus and pd.decode.gpus. (pd.prefill.gpus=%v, pd.decode.gpus=%v.) The two roles rarely want the same number, and in colocate both would otherwise inherit model.gpus and double-claim the node. A GPU-less role sets gpus to 0 or \"0\" -- a real claim, not empty." $pd.prefill.gpus $pd.decode.gpus) -}}
+{{- end -}}
+
+{{- /* Colocate is 1P1D inside a merged pod in v1: one prefill container, one
+       decode container. Anything else the user set on the role would be
+       silently ignored, so reject it. Scale by raising replicaCount (more
+       appliances), or use the DisaggregatedSet shape (pd.colocate: false)
+       for per-role scaling. */ -}}
+{{- if $pd.colocate -}}
+{{- if or (ne (int ($pd.prefill.replicas | default 1)) 1) (ne (int ($pd.decode.replicas | default 1)) 1) (ne (int ($pd.prefill.size | default 1)) 1) (ne (int ($pd.decode.size | default 1)) 1) -}}
+{{- fail "sglang: pd.colocate v1 renders exactly one prefill and one decode container per pod. pd.prefill.replicas, pd.decode.replicas, pd.prefill.size and pd.decode.size must all be 1. Scale by raising replicaCount (more appliances), or use the DisaggregatedSet shape (pd.colocate: false) for per-role scaling." -}}
+{{- end -}}
+{{- end -}}
+
+{{- end -}}
