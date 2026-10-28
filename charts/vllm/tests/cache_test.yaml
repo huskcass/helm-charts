@@ -152,3 +152,56 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "requires env HOME"
+
+  # pd.<role>.extraArgs are appended after the top-level list and have to be
+  # part of the compile-cache hash, or prefill and decode share one template
+  # directory. Non-colocate: scaler off, rdma on, an explicit GPU split.
+  - it: prefill and decode with different role extraArgs get different template hashes
+    template: templates/pd-ds.yaml
+    documentSelector:
+      path: kind
+      value: DisaggregatedSet
+    set:
+      scaler.enabled: false
+      pd.enabled: true
+      rdma.enabled: true
+      pd.prefill.gpus: 1
+      pd.decode.gpus: 1
+      pd.prefill.extraArgs:
+        - "--tensor-parallel-size"
+        - "4"
+        - "--gpu-memory-utilization"
+        - "0.9"
+      pd.decode.extraArgs:
+        - "--tensor-parallel-size"
+        - "2"
+        - "--enforce-eager"
+    asserts:
+      - equal:
+          path: spec.roles[?(@.name == "prefill")].spec.leaderWorkerTemplate.leaderTemplate.spec.containers[?(@.name == "vllm")].env[?(@.name == "VLLM_CACHE_TEMPLATE_HASH")].value
+          value: e10c53668a
+      - equal:
+          path: spec.roles[?(@.name == "decode")].spec.leaderWorkerTemplate.leaderTemplate.spec.containers[?(@.name == "vllm")].env[?(@.name == "VLLM_CACHE_TEMPLATE_HASH")].value
+          value: f7506d89be
+      - notEqual:
+          path: spec.roles[?(@.name == "decode")].spec.leaderWorkerTemplate.leaderTemplate.spec.containers[?(@.name == "vllm")].env[?(@.name == "VLLM_CACHE_TEMPLATE_HASH")].value
+          value: e10c53668a
+
+---
+# `cache:` with no body is YAML null. The schema's type object does not reject
+# it, so the configmap has to tolerate a nil cache the way the pod templates do.
+# Its own suite: the one above sets cache.enabled, and a later null would only
+# be layered on top of that map.
+suite: null cache value
+release:
+  name: ci
+set:
+  modelRoute.nginx.outputConfigMap: ci/openresty-conf
+tests:
+  - it: renders when cache is null
+    template: templates/cache-configmap.yaml
+    set:
+      cache: null
+    asserts:
+      - hasDocuments:
+          count: 0

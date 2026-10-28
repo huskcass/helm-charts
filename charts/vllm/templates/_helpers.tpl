@@ -96,28 +96,46 @@
   Template hash for cache isolation. Evaluates all inputs that define compiled kernel compatibility:
   image repo & tag, model name, context length (model.maxLen, its old name, wins
   when set -- as on the command line), extraArgs (where --tensor-parallel-size /
-  --pipeline-parallel-size live), and compiler-relevant environment variables.
+  --pipeline-parallel-size live), the calling pd role's extraArgs, and
+  compiler-relevant environment variables.
+  pd.<role>.extraArgs are appended after the top-level list on the command line
+  (_pod.tpl, including colocate). They are hashed for this pod's role, and only
+  when that list is non-empty, so a non-pd render and a pd role with no role
+  flags keep the previous input list.
   The GPU type is not an input: the cache is a hostPath, so it never leaves the
   node, and vLLM keys its own torch.compile cache on the hardware as well.
+
+  include "vllm.cacheTemplateHash" (dict "root" $root "role" $role "roleCfg" $roleCfg)
 */}}
 {{- define "vllm.cacheTemplateHash" -}}
+{{- $root := .root -}}
+{{- $role := .role | default "" -}}
+{{- $roleCfg := .roleCfg | default dict -}}
 {{- $envList := list -}}
-{{- range .Values.env -}}
+{{- range $root.Values.env -}}
   {{- $envList = append $envList (printf "%s=%s" .name (include "vllm.envValueString" .value)) -}}
 {{- end -}}
-{{- $ctxLen := .Values.model.contextLength -}}
-{{- if hasKey .Values.model "maxLen" -}}
-{{- $ctxLen = .Values.model.maxLen -}}
+{{- $ctxLen := $root.Values.model.contextLength -}}
+{{- if hasKey $root.Values.model "maxLen" -}}
+{{- $ctxLen = $root.Values.model.maxLen -}}
 {{- end -}}
+{{- /* Role flags land after the top-level extraArgs. Omit an empty list so the
+       hashed input stays byte-for-byte what a non-pd pod has always hashed. */ -}}
 {{- $inputs := list
-      .Values.image.repository
-      .Values.image.tag
-      .Values.model.name
+      $root.Values.image.repository
+      $root.Values.image.tag
+      $root.Values.model.name
       $ctxLen
-      .Values.extraArgs
-      $envList
-    | toJson -}}
-{{- sha256sum $inputs | trunc 10 -}}
+      $root.Values.extraArgs
+-}}
+{{- if or (hasPrefix "prefill-" $role) (hasPrefix "decode-" $role) -}}
+{{- $roleArgs := $roleCfg.extraArgs | default list -}}
+{{- if $roleArgs -}}
+{{- $inputs = append $inputs $roleArgs -}}
+{{- end -}}
+{{- end -}}
+{{- $inputs = append $inputs $envList -}}
+{{- $inputs | toJson | sha256sum | trunc 10 -}}
 {{- end -}}
 
 {{/*
