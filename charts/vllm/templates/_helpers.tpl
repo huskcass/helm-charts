@@ -81,6 +81,63 @@
 {{- end -}}
 
 {{/*
+  The per-model directory under cache.hostPath, and the default for
+  cache.hostPathSuffix -- so every release serving one model shares its warm
+  kernels on a node, instead of each install compiling its own copy.
+
+  model.name can be a HF repo id, so "/" and ":" fold to "--" rather than
+  turning one name into nested directories.
+*/}}
+{{- define "vllm.cacheModelDir" -}}
+{{- .Values.model.name | replace "/" "--" | replace ":" "--" -}}
+{{- end -}}
+
+{{/*
+  Template hash for cache isolation. Evaluates all inputs that define compiled kernel compatibility:
+  image repo & tag, model name, context length (model.maxLen, its old name, wins
+  when set -- as on the command line), extraArgs (where --tensor-parallel-size /
+  --pipeline-parallel-size live), and compiler-relevant environment variables.
+  The GPU type is not an input: the cache is a hostPath, so it never leaves the
+  node, and vLLM keys its own torch.compile cache on the hardware as well.
+*/}}
+{{- define "vllm.cacheTemplateHash" -}}
+{{- $envList := list -}}
+{{- range .Values.env -}}
+  {{- $envList = append $envList (printf "%s=%s" .name (include "vllm.envValueString" .value)) -}}
+{{- end -}}
+{{- $ctxLen := .Values.model.contextLength -}}
+{{- if hasKey .Values.model "maxLen" -}}
+{{- $ctxLen = .Values.model.maxLen -}}
+{{- end -}}
+{{- $inputs := list
+      .Values.image.repository
+      .Values.image.tag
+      .Values.model.name
+      $ctxLen
+      .Values.extraArgs
+      $envList
+    | toJson -}}
+{{- sha256sum $inputs | trunc 10 -}}
+{{- end -}}
+
+{{/*
+  Container HOME that wire_cache() resolves via expanduser("~"). Chart-visible
+  only: an explicit env HOME value wins; otherwise /root, matching the chart's
+  default empty securityContext (image user, uid 0 → /root on the vLLM
+  images this chart targets). A non-root runAsUser without env HOME is refused
+  by the collision guard in _pod.tpl — passwd home is unknowable at render time.
+*/}}
+{{- define "vllm.cacheHome" -}}
+{{- $home := "/root" -}}
+{{- range .Values.env -}}
+{{- if and (eq .name "HOME") (hasKey . "value") (ne (include "vllm.envValueString" .value) "") -}}
+{{- $home = trimSuffix "/" (include "vllm.envValueString" .value) -}}
+{{- end -}}
+{{- end -}}
+{{- $home -}}
+{{- end -}}
+
+{{/*
   The labels every engine pod carries on top of the chart's own (app, role):
   podLabels, plus rdma-ib: "true" when rdma.enabled under lws.enabled OR under
   pd's DisaggregatedSet shape -- the label rdma-injector keys off. A podLabels
