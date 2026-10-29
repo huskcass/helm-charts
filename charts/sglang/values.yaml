@@ -206,6 +206,11 @@ pd:
     # sets 0. Outside pd the engine falls back to top-level model.gpus.
     gpus: ""
     extraArgs: []
+    # Role-level env, merged last over chart env + top-level user env. Same
+    # merge semantics as extraArgs: an entry here wins against both. Use it
+    # for role-specific tuning (e.g. a prefill-only cache knob) rather than
+    # duplicating everything in top-level env.
+    env: []
     affinityReplace: null
     schedulerName: ""
   decode:
@@ -216,6 +221,7 @@ pd:
     distPort: ""
     gpus: ""
     extraArgs: []
+    env: []
     affinityReplace: null
     schedulerName: ""
 
@@ -335,6 +341,74 @@ localKVOffload:
     # int. Max re-issues before the request is admitted on device data
     # alone. Engine default 8.
     storage-prefetch-retry-max-attempts: null
+
+# Tier-3 KV offload: spill KV from GPU to host RAM (L2) AND further to a
+# distributed storage tier (L3). Subsumes localKVOffload -- turning this on
+# renders --enable-hierarchical-cache itself, so localKVOffload.enabled must
+# stay false. The chart fails the render if both are true.
+#
+# Render rules:
+#   - enabled:        master switch. Nothing below renders when false.
+#   - backend:        only hicache today. Renders --enable-hierarchical-cache.
+#   - storage_backend:L3 backend the engine spills to. Required non-empty when
+#                     enabled=true; rendered verbatim as
+#                     --hicache-storage-backend=<value>.
+#   - hicache:        every set key emits one --hicache-<key>=<value>, in order.
+#                     Engine argparse owns compat validation (same contract as
+#                     localKVOffload.hicache).
+#   - mooncake.*:     only the keys the user explicitly sets land on the pod as
+#                     MOONCAKE_* env vars. Unset keys are absent on the rendered
+#                     pod. See the device knob below: on a multi-rail cluster
+#                     the auto-pick it enables is dangerous, so set it.
+#   - use_hugepage:   when true, emits the MC_STORE_USE_HUGEPAGE /
+#                     MC_STORE_HUGEPAGE_SIZE env, adds a hugepages-<size>
+#                     resource limit on the engine container, and adds a
+#                     /dev/hugepages emptyDir volume + mount (medium:
+#                     HugePages -- per-pod, accounted against the pod's
+#                     hugepages limit, released with the pod). The k8s resource
+#                     suffix is derived from page_size via a small known-set
+#                     table (2MB/2Mi/2048KB/../... -> 2Mi; 1GB/1Gi/... -> 1Gi);
+#                     anything outside fails at render -- set resources.limits
+#                     by hand in that case.
+#
+# PD decode pods receive none of this section (same $isPdDecode guard as
+# localKVOffload) -- the engine forces disable_radix_cache=True on decode,
+# which is incompatible with --enable-hierarchical-cache.
+storageKVOffload:
+  enabled: false
+  backend: hicache
+  storage_backend: null
+  hicache:
+    host-memory-mode: null
+    ratio: null
+    size: null
+    host-memory-fraction: null
+    write-policy: null
+    io-backend: null
+    mem-layout: null
+    storage-prefetch-policy: null
+    storage-backend-extra-config: null
+    storage-prefetch-retry-poll-interval: null
+    storage-prefetch-retry-max-attempts: null
+  mooncake:
+    master: null
+    # With P2PHANDSHAKE, also set MOONCAKE_LOCAL_HOSTNAME via the top-level
+    # env: block using valueFrom.fieldRef.status.podIP, or peers dial
+    # "localhost" and fail.
+    te_meta_data_server: null
+    protocol: null
+    # The HCAs mooncake-store opens (e.g. mlx5_5, or "mlx5_3,mlx5_4" for
+    # multi-rail). Leave unset to let mooncake auto-pick -- which is dangerous
+    # on multi-rail clusters: different nodes happen to auto-pick different
+    # HCAs, and peers on incompatible rails fail at runtime with "Failed to
+    # open segment" errors that do not point at the cause. Set explicitly on
+    # any non-trivial cluster.
+    device: null
+    global_segment_size: null
+    use_hugepage: false
+    hugepage:
+      page_size: null
+      resource_limit: null
 
 image:
   repository: "lmsysorg/sglang"

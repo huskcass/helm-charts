@@ -115,6 +115,12 @@
 {{- if and (not $override) (not $hasModel) }}
 {{- fail "vllm: model.localPath is empty while the chart is still building vLLM's command line, and vLLM cannot start without --model. Set commandOverride to run a non-vLLM image, or point model.localPath at the weights" }}
 {{- end }}
+{{- /* storageKVOffload is a stub on the vllm chart: kept as a namespace for
+       parity with sglang, no rendering behind it yet. Fail loud rather than
+       silently drop a setting that does meaningful work elsewhere. */}}
+{{- if $root.Values.storageKVOffload.enabled | default false }}
+{{- fail "vllm: storageKVOffload is not implemented on this chart (kept as a stub for sglang-chart parity). Use localKVOffload instead, or drop the section" }}
+{{- end }}
 {{- /*
   The engine command line, built once so both command forms say the same thing.
   Skipped entirely under commandOverride.
@@ -544,6 +550,26 @@
   {{- if $needsRdma }}
   {{- if kindIs "invalid" (index (index $res "limits" | default dict) "rdma/hca_shared") }}
   {{- $res = mergeOverwrite (deepCopy $res) (dict "limits" (dict "rdma/hca_shared" "1")) }}
+  {{- end }}
+  {{- end }}
+  {{- /* K8s requires a cpu or memory request alongside any hugepages-* limit
+         (the API server rejects the pod otherwise). This chart has no
+         hugepages-* render path of its own -- the only way one lands on an
+         engine container is the user setting it under resources: -- so gate
+         the floor on its presence. A user-set value in requests or limits
+         counts as "user has it" for that key. */}}
+  {{- $hasHugepage := false }}
+  {{- range $k, $_ := (index $res "limits" | default dict) }}
+  {{- if hasPrefix "hugepages-" $k }}{{ $hasHugepage = true }}{{ end }}
+  {{- end }}
+  {{- if $hasHugepage }}
+  {{- $reqs := index $res "requests" | default dict }}
+  {{- $lims := index $res "limits" | default dict }}
+  {{- if and (kindIs "invalid" (index $reqs "cpu")) (kindIs "invalid" (index $lims "cpu")) }}
+  {{- $res = mergeOverwrite (deepCopy $res) (dict "requests" (dict "cpu" "1")) }}
+  {{- end }}
+  {{- if and (kindIs "invalid" (index $reqs "memory")) (kindIs "invalid" (index $lims "memory")) }}
+  {{- $res = mergeOverwrite (deepCopy $res) (dict "requests" (dict "memory" "4Gi")) }}
   {{- end }}
   {{- end }}
   {{- with $res }}
