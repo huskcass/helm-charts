@@ -1,5 +1,5 @@
 # Copies vendored charts from the latest stable GitHub Release of each upstream
-# repo (hack/sync-upstream-charts.py) and opens a pull request.
+# repo (hack/sync-upstream-charts.py) and opens or updates a pull request.
 #
 # The pull request is the point. main publishes immediately: release.yml
 # packages every chart whose version moved and pushes it to GitHub Pages.
@@ -9,9 +9,9 @@ name: sync-upstream-charts
 
 on:
   schedule:
-    # 08:00 PT on weekdays in standard time (PST, UTC-8); GitHub cron is UTC,
+    # 08:00 PT every day in standard time (PST, UTC-8); GitHub cron is UTC,
     # so it runs at 09:00 PT during daylight time.
-    - cron: '0 16 * * 1-5'
+    - cron: '0 16 * * *'
   workflow_dispatch:
 
 permissions:
@@ -33,8 +33,9 @@ jobs:
           # Full history: check-chart-version.sh merge-bases against origin/main,
           # and check-chart-images.sh reads the base Chart.yaml out of git.
           fetch-depth: 0
-          # Keep the token. ci.yml turns this off because nothing there pushes;
-          # this job pushes chore/sync-upstream-charts (never main) with it.
+          # ci.yml turns this off because nothing there pushes. This job does
+          # not push with the checkout token either: create-pull-request pushes
+          # chore/sync-upstream-charts (never main) with its token input.
           persist-credentials: true
 
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
@@ -61,14 +62,23 @@ jobs:
         continue-on-error: true
         env:
           # GITHUB_TOKEN raises the API rate limit. Pushes and pull requests
-          # made with it do not trigger other workflows; see the push step.
+          # made with it do not trigger other workflows; see the pull request step.
           GH_TOKEN: ${{ github.token }}
         run: python3 hack/sync-upstream-charts.py --pr-body "$RUNNER_TEMP/pr-body.md"
 
-      # Commit locally, then gate, then push. check-chart-version.sh diffs
-      # commits, so it has to follow the commit; check-chart-images.sh reads the
-      # tree either way. Nothing is pushed unless both pass. The refspec below
-      # is the chore branch, never main.
+      # Commit locally on the checked-out base, then gate, then let
+      # create-pull-request publish. check-chart-version.sh diffs commits, so
+      # the commit comes first; check-chart-images.sh reads the tree either
+      # way. Nothing is pushed unless both pass: a failure here stops the job
+      # before the action runs. The action pushes chore/sync-upstream-charts,
+      # never main.
+      #
+      # Stay on the branch actions/checkout left us on (main for the schedule).
+      # Commits made there during the workflow are what the action puts on the
+      # pull request branch. It updates an open pull request from
+      # chore/sync-upstream-charts instead of opening another, and leaves that
+      # branch in place (delete-branch defaults to false) so the next run
+      # reuses it.
       #
       # Pushes and pull requests made with GITHUB_TOKEN do not trigger other
       # workflows (ci.yml, check-images.yml). That is why lint, inside the sync
@@ -77,68 +87,53 @@ jobs:
       # branch. A PAT or a GitHub App token would trigger them, and none is
       # configured.
       #
-      # gh pr create with GITHUB_TOKEN also needs the repository (or org)
-      # setting "Allow GitHub Actions to create and approve pull requests".
-      # Without it the push succeeds and the pull request call fails.
-      - name: Commit, gate, and open or update the pull request
+      # GITHUB_TOKEN, also when used by create-pull-request, needs the
+      # repository (or org) setting "Allow GitHub Actions to create and approve
+      # pull requests". Without it the push succeeds and the pull request call
+      # fails.
+      - name: Commit synced charts and run the image and version checks
+        id: gate
         if: steps.sync.outputs.synced != ''
         env:
-          GH_TOKEN: ${{ github.token }}
+          SYNCED: ${{ steps.sync.outputs.synced }}
         run: |
           set -euo pipefail
 
-          names="${{ steps.sync.outputs.synced }}"
-
-          # The schedule checks out main. Recreate the branch from that commit
-          # on every run (the previous sync is not a parent), and keep the
-          # working tree the script just wrote.
-          git checkout -B chore/sync-upstream-charts
-          git add -A -- charts
-          if git diff --cached --quiet; then
+          # The sync reported charts, but the tree matches the checkout.
+          # Skip the pull request: running the action with nothing ahead of
+          # base would reset the existing branch.
+          if [ -z "$(git status --porcelain -- charts)" ]; then
             echo "no chart file changes; not opening a pull request"
+            echo "changes=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: sync ${names} from upstream stable releases"
+          git add -A -- charts
+          # Local only. create-pull-request is what publishes, and only the
+          # chore branch. check-chart-version.sh needs this commit to exist.
+          git commit -m "chore: sync ${SYNCED} from upstream stable releases"
 
           git fetch --no-tags origin main
           hack/check-chart-images.sh origin/main
           hack/check-chart-version.sh origin/main
 
-          branch="$(git rev-parse --abbrev-ref HEAD)"
-          if [ "${branch}" != "chore/sync-upstream-charts" ]; then
-            echo "::error::refusing to push from ${branch}; this workflow only pushes chore/sync-upstream-charts"
-            exit 1
-          fi
+          echo "changes=true" >> "$GITHUB_OUTPUT"
 
-          # The branch is rebuilt from main every run, so the update is not a
-          # fast-forward. --force-with-lease refuses the push if the remote
-          # branch moved since the fetch below. Skip the push entirely when
-          # the remote tree is already identical: a new commit with the same
-          # files would only churn the pull request.
-          git fetch origin chore/sync-upstream-charts || true
-          if git rev-parse --verify --quiet refs/remotes/origin/chore/sync-upstream-charts >/dev/null; then
-            if [ "$(git rev-parse 'HEAD^{tree}')" = "$(git rev-parse 'refs/remotes/origin/chore/sync-upstream-charts^{tree}')" ]; then
-              echo "origin/chore/sync-upstream-charts already has this tree; skipping push"
-            else
-              git push --force-with-lease origin HEAD:chore/sync-upstream-charts
-            fi
-          else
-            git push origin HEAD:chore/sync-upstream-charts
-          fi
-
-          title="chore: sync ${names} from upstream stable releases"
-          existing="$(gh pr list --head chore/sync-upstream-charts --state open --json number --jq '.[].number')"
-          if [ -n "${existing}" ]; then
-            for n in ${existing}; do
-              gh pr edit "${n}" --title "${title}" --body-file "${RUNNER_TEMP}/pr-body.md"
-            done
-          else
-            gh pr create --base main --head chore/sync-upstream-charts \
-              --title "${title}" --body-file "${RUNNER_TEMP}/pr-body.md"
-          fi
+      - name: Open or update the pull request
+        if: steps.sync.outputs.synced != '' && steps.gate.outputs.changes == 'true'
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
+        with:
+          token: ${{ github.token }}
+          base: main
+          branch: chore/sync-upstream-charts
+          add-paths: charts
+          commit-message: 'chore: sync ${{ steps.sync.outputs.synced }} from upstream stable releases'
+          title: 'chore: sync ${{ steps.sync.outputs.synced }} from upstream stable releases'
+          body-path: ${{ runner.temp }}/pr-body.md
+          committer: 'github-actions[bot] <41898283+github-actions[bot]@users.noreply.github.com>'
+          author: 'github-actions[bot] <41898283+github-actions[bot]@users.noreply.github.com>'
 
       # Runs even when the sync step failed, so a chart that needs attention
       # turns the job red after the pull request for the charts that did sync
