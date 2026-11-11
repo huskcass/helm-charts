@@ -63,6 +63,26 @@ The charts default to public images on Docker Hub under
 registry by overriding the `image` values — a mirror is worth setting up if your
 cluster has no egress.
 
+## Upstream chart sync
+
+`swiss`, `console` and `llmscaleoperator` are vendored from their own
+repositories. [`hack/sync-upstream-charts.py`](hack/sync-upstream-charts.py)
+copies the latest stable GitHub Release of each over `charts/<name>/` and the
+workflow opens a pull request. It does not push to `main`: a merge there
+publishes the chart immediately. Drafts, prereleases and tags with a
+pre-release suffix (`rc`, `beta`, `alpha`, `preview`, `snapshot`) are not
+stable.
+
+The copy here is not byte-for-byte. Images are rewritten to the Docker Hub
+mirrors under `4pdosc` (the same ones [Images](#images) describes), README
+files are left as the upstream wrote them, and a few helm-charts-only edits
+are kept. What is copied, rewritten and kept is
+[`hack/sync-upstream-charts.yaml`](hack/sync-upstream-charts.yaml).
+
+```bash
+python3 hack/sync-upstream-charts.py --check
+```
+
 ## Custom resources
 
 Some optional features render custom resources that the chart does not define:
