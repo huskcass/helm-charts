@@ -959,9 +959,14 @@ cart:
   configOverlays:
     - key: workers.yaml
       autoconfig: true
-  # image:
-  #   repository: 4pdosc/cache_aware_router
-  #   tag: ""            # defaults to the subchart's appVersion
+  image:
+    repository: 4pdosc/cache_aware_router
+    tag: ""            # empty falls back to the subchart's appVersion
+  # Sidecar images are a single repository:tag (no appVersion fallback).
+  reload:
+    image: 4pdosc/autoconfig-reload:0.3.31
+  ha:
+    image: 4pdosc/autoconfig-hagate:0.3.31
   # CART's listen port, which the ModelRoute's cart.port follows.
   # service:
   #   port: 8071
@@ -1006,9 +1011,9 @@ continuationGateway:
   enabled: false
   config:
     continuationEngine: vllm        # the engine this chart deploys; leave as is
-  # image:
-  #   repository: 4pdosc/continuation_gateway
-  #   tag: ""            # defaults to the subchart's appVersion
+  image:
+    repository: 4pdosc/continuation_gateway
+    tag: ""            # empty falls back to the subchart's appVersion
   # config:
   #   continuationModel: "glm-5.3"    # REQUIRED when enabled: the real model, one string
   #   bufferToolCalls: true
