@@ -962,11 +962,6 @@ cart:
   image:
     repository: 4pdosc/cache_aware_router
     tag: ""            # empty falls back to the subchart's appVersion
-  # Sidecar images are a single repository:tag (no appVersion fallback).
-  reload:
-    image: 4pdosc/autoconfig-reload:0.3.31
-  ha:
-    image: 4pdosc/autoconfig-hagate:0.3.31
   # CART's listen port, which the ModelRoute's cart.port follows.
   # service:
   #   port: 8071
