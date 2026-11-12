@@ -9,6 +9,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = Path(__file__).resolve().parent / "sync-upstream-charts.py"
@@ -95,6 +96,36 @@ class VersionComparisonTest(unittest.TestCase):
     def test_unparseable_version_is_an_error(self):
         with self.assertRaises(mod.ChartError):
             mod.is_strictly_newer("nightly", "0.1.0")
+
+    def test_release_sorts_after_same_number_prerelease(self):
+        self.assertTrue(mod.is_strictly_newer("1.2.3", "1.2.3-rc1"))
+        self.assertFalse(mod.is_strictly_newer("1.2.3-rc1", "1.2.3"))
+        # Identifiers are not ordered; select_stable_release drops them.
+        self.assertFalse(mod.is_strictly_newer("1.2.3-rc2", "1.2.3-beta.1"))
+
+
+class TagChartVersionTest(unittest.TestCase):
+    def test_v_prefix_and_quotes_match(self):
+        mod.require_tag_matches_chart_version("owner/repo", "v0.5.1", "0.5.1")
+        mod.require_tag_matches_chart_version("owner/repo", "0.7.3", '"0.7.3"')
+        mod.require_tag_matches_chart_version("owner/repo", "'v0.7.3'", "0.7.3")
+
+    def test_mismatch_names_repo_tag_and_version(self):
+        with self.assertRaises(mod.ChartError) as caught:
+            mod.require_tag_matches_chart_version("owner/repo", "v0.5.2", "0.5.1")
+        self.assertEqual(
+            str(caught.exception),
+            "owner/repo release v0.5.2 has Chart.yaml version 0.5.1; "
+            "the tag and chart version must match",
+        )
+
+    def test_unparseable_chart_version_is_a_mismatch(self):
+        with self.assertRaises(mod.ChartError) as caught:
+            mod.require_tag_matches_chart_version("owner/repo", "v1.2.3", "nightly")
+        message = str(caught.exception)
+        self.assertIn("owner/repo", message)
+        self.assertIn("v1.2.3", message)
+        self.assertIn("nightly", message)
 
 
 class ImageRewriteTest(unittest.TestCase):
@@ -250,6 +281,50 @@ class ExtractTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "outside.txt").exists())
             escaped = list(Path(tmp).rglob("outside.txt"))
             self.assertEqual(escaped, [])
+
+
+class SyncTargetTest(unittest.TestCase):
+    def test_tag_chart_version_mismatch_needs_attention_and_leaves_dest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "charts" / "demo"
+            dest.mkdir(parents=True)
+            original = 'name: demo\nversion: 0.5.0\nappVersion: "0.5.0"\n'
+            (dest / "Chart.yaml").write_text(original, encoding="utf-8")
+            (dest / "values.yaml").write_text("kept: true\n", encoding="utf-8")
+
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                payload = b'name: demo\nversion: 0.5.1\nappVersion: "9.9.9"\n'
+                info = tarfile.TarInfo(name="demo-0.5.2/charts/demo/Chart.yaml")
+                info.size = len(payload)
+                tar.addfile(info, io.BytesIO(payload))
+                values = b"changed: true\n"
+                info = tarfile.TarInfo(name="demo-0.5.2/charts/demo/values.yaml")
+                info.size = len(values)
+                tar.addfile(info, io.BytesIO(values))
+
+            target = {
+                "name": "demo",
+                "repo": "owner/repo",
+                "path": "charts/demo",
+                "dest": str(dest),
+            }
+            with (
+                patch.object(mod, "list_releases", return_value=[_release("v0.5.2")]),
+                patch.object(mod, "download_tarball", return_value=buf.getvalue()),
+            ):
+                result = mod.sync_target(target, check=False, skip_image_check=True)
+
+            self.assertEqual(result.result, "needs attention")
+            self.assertEqual(result.repo, "owner/repo")
+            self.assertEqual(result.upstream, "v0.5.2")
+            self.assertEqual(
+                result.detail,
+                "owner/repo release v0.5.2 has Chart.yaml version 0.5.1; "
+                "the tag and chart version must match",
+            )
+            self.assertEqual((dest / "Chart.yaml").read_text(encoding="utf-8"), original)
+            self.assertEqual((dest / "values.yaml").read_text(encoding="utf-8"), "kept: true\n")
 
 
 class RenderedImageTest(unittest.TestCase):

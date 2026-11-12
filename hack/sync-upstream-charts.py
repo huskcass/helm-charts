@@ -12,8 +12,9 @@ publication time, and a release candidate published after the current stable
 tag would otherwise win.
 
 The chart here is replaced only when that version is strictly newer than
-charts/<name>/Chart.yaml. An equal or older upstream is left untouched, so a
-helm-charts-only edit is never overwritten by a re-run.
+charts/<name>/Chart.yaml, and only when the tag matches upstream's Chart.yaml
+version. An equal or older upstream is left untouched, so a helm-charts-only
+edit is never overwritten by a re-run.
 
 Image repositories are rewritten to the Docker Hub mirrors this repository
 publishes, except in README*.md (those document the OCI chart) and except
@@ -26,9 +27,10 @@ rewrites, the text patches that keep our comments, and the files we keep.
 
 Exit 0 when nothing is behind, or every chart that was behind was synced.
 Exit 1 when a chart needs a human (a patch no longer matches, a kept
-Chart.yaml's dependencies diverged, lint or template failed). A missing
-Docker Hub image is a warning and a skip, not a failure: the image is often
-simply not published yet, and the chart already in this repo still installs.
+Chart.yaml's dependencies diverged, the release tag and Chart.yaml version
+disagree, lint or template failed). A missing Docker Hub image is a warning
+and a skip, not a failure: the image is often simply not published yet, and
+the chart already in this repo still installs.
 """
 
 from __future__ import annotations
@@ -86,7 +88,7 @@ class ImageMissing(Exception):
     """A Docker Hub mirror the chart renders is not published yet.
 
     Not a ChartError: the chart is left as it was and the run still succeeds.
-    The image usually shows up on the next weekday.
+    The image usually shows up on a later daily run.
     """
 
     def __init__(self, missing: list[str]):
@@ -136,22 +138,15 @@ def normalize_version(value: str):
     return parse_semver(text)
 
 
-def _pre_key(pre: str | None):
-    """Semver precedence: a release sorts after every pre-release of it."""
-    if not pre:
-        return (1,)
-    parts = []
-    for ident in pre.split("."):
-        if ident.isdigit():
-            parts.append((0, int(ident)))
-        else:
-            parts.append((1, ident))
-    return (0, tuple(parts))
-
-
 def _order(parsed) -> tuple:
+    """(major, minor, patch, release beats a pre-release of the same numbers).
+
+    Pre-release identifiers are not ordered against each other.
+    select_stable_release already drops them. A local Chart.yaml can still be
+    a pre-release, and the release of those numbers has to count as newer.
+    """
     major, minor, patch, pre = parsed
-    return (major, minor, patch, _pre_key(pre))
+    return (major, minor, patch, pre is None)
 
 
 def is_strictly_newer(upstream_tag: str, current_version: str) -> bool:
@@ -167,6 +162,24 @@ def is_strictly_newer(upstream_tag: str, current_version: str) -> bool:
             f"cannot compare versions {upstream_tag!r} and {current_version!r}"
         )
     return _order(upstream) > _order(current)
+
+
+def require_tag_matches_chart_version(repo: str, tag: str, chart_version: str) -> None:
+    """The release tag and Chart.yaml `version` must be the same semver.
+
+    Leading v and quotes are ignored. An unparseable chart version is a
+    mismatch: the version that would be written has to be the tag, or a later
+    run cannot tell the chart was updated. appVersion is not compared; it can
+    differ from the tag.
+    """
+    parsed_tag = normalize_version(tag)
+    parsed_chart = normalize_version(chart_version)
+    if parsed_chart is not None and parsed_tag == parsed_chart:
+        return
+    raise ChartError(
+        f"{repo} release {tag} has Chart.yaml version {chart_version}; "
+        "the tag and chart version must match"
+    )
 
 
 def select_stable_release(releases: list[dict]) -> dict | None:
@@ -808,6 +821,13 @@ def sync_target(target: dict, *, check: bool, skip_image_check: bool) -> Result:
         extract_chart(blob, target["path"], extracted)
         if not (extracted / "Chart.yaml").is_file():
             raise ChartError(f"upstream {target['path']} has no Chart.yaml")
+        require_tag_matches_chart_version(
+            target["repo"],
+            tag,
+            read_top_level_scalar(
+                (extracted / "Chart.yaml").read_text(encoding="utf-8"), "version"
+            ),
+        )
         changed = True
         if dest.exists():
             shutil.rmtree(dest)

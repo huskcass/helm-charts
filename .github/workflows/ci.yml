@@ -132,7 +132,7 @@ jobs:
             exit 1
           fi
 
-      # The weekday sync opens a pull request from whatever this selector
+      # The daily sync opens a pull request from whatever this selector
       # decides is stable. A broken filter would vendor a release candidate,
       # so the pure functions are tested here on every change. PyYAML is the
       # script's only non-stdlib dependency.
